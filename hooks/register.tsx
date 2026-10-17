@@ -1,0 +1,1370 @@
+// review-layers: the Claude Code team's review process, recrafted as a mod
+// for one person and their agent. Layers, not one gate:
+//
+//   1. verify      the project's own checks run (typecheck, lint, test): no tokens
+//   2. risk tier   set from the change, never the author: low / medium / high
+//   3. hunters     parallel reviewers on the diff, each with one lens
+//   4. verifiers   vote on every finding; only confirmed ones are posted
+//   5. security    its own lens; an open security finding always blocks
+//   6. converge    round cap, diff-only re-review, no repeated findings
+//   7. gate        git push and gh pr wait for green (+ approval by tier)
+//
+// Token-light by design: haiku by default, the diff sent once with a cache
+// mark so the hunters share it, verifiers see one hunk each, later rounds
+// re-read only files whose diff changed, and every run reports its spend.
+
+import { atom, read, update } from 'claude-code'
+import type { Register } from 'claude-code'
+import type {
+  ReviewLayersEvidence as Evidence,
+  ReviewLayersFinding as Finding,
+  ReviewLayersLayer as Layer,
+  ReviewLayersView as View,
+} from '../types'
+
+const NAME = 'review-layers'
+const PANE = 'review-layers'
+const TOOL = 'mcp__review-layers__land'
+const STORE_KEY = 'projects'
+const view = atom({ plugin: 'review-layers', key: 'view' } as const, null as View | null)
+
+// set once at register: the options the helpers below read
+let OPTS: Record<string, unknown> = {}
+const approvalsMode = () => (String(OPTS.approvals ?? 'author-counts') === 'strict' ? 'strict' : 'author-counts')
+const autoFix = () => OPTS.autoFix !== false
+
+// who must sign off: the person who prompted the change counts as its one
+// reviewer, so only high risk (or strict mode) asks for a typed approval
+function needsPerson(tier: Tier): boolean {
+  return tier === 'high' || (tier === 'medium' && approvalsMode() === 'strict')
+}
+
+type Depth = 'quick' | 'standard' | 'deep'
+type Tier = 'low' | 'medium' | 'high'
+type Lens = 'correctness' | 'edges' | 'security'
+
+type Pass = {
+  diffHash: string
+  head: string | null
+  tier: Tier
+  status: 'green' | 'red' | 'amber'
+  approved: boolean
+  note: string
+  at: number
+  open: number
+  scope: string
+  humanTouches: number
+}
+type Round = { count: number; posted: Record<string, number>; fileHashes: Record<string, string>; resolved: Record<string, string> }
+type Human = { approvals: number; resolves: number; landings: number; landingsNoPerson: number }
+type Project = { pass?: Pass; rounds: Record<string, Round>; tokens: number; runs: number; lastAt: number; findings: Finding[]; human?: Human }
+const humanOf = (p: Project): Human => (p.human ??= { approvals: 0, resolves: 0, landings: 0, landingsNoPerson: 0 })
+
+type Snapshot = {
+  isRepo: boolean
+  root: string
+  head: string | null
+  branch: string
+  baseName: string | null
+  ahead: number
+  diff: string
+  untracked: number
+  dirty: boolean
+}
+
+const HELP =
+  '/land [quick|standard|deep] [focus]: run every layer on the changes that would be pushed\n' +
+  '/land status: where the current changes stand\n' +
+  '/land fix: ask Claude to fix the open findings (every instance of each class), then re-run\n' +
+  '/land resolve <n> <reason>: close finding n as wrong or intentional (it will not be posted again)\n' +
+  '/land approve [note]: the human sign-off a medium or high tier needs before push\n' +
+  '/land learn <note>: add a lesson to REVIEW.md so the reviewer looks for it next time\n' +
+  '/land init: write a starter REVIEW.md for this project\n' +
+  '/land incident <commit> <what broke>: add a past incident to the eval set\n' +
+  '/land eval: re-run the hunters over every incident and report recall\n' +
+  '/land pr: a PR body with Testing, Risk and How to revert filled from the last run\n' +
+  '/land pane: open the layers pane · /land reset: forget this branch\'s rounds'
+
+const GENERATED =
+  /(^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|composer\.lock|go\.sum|Gemfile\.lock)$|\.min\.(js|css)$|\.(snap|map|svg|png|jpe?g|gif|ico|woff2?|ttf|pdf|lock)$|(^|\/)(dist|build|out|node_modules|\.next|coverage|vendor)\//
+
+const ALWAYS_HUMAN: RegExp[] = [
+  /(^|\/)\.github\/workflows\//,
+  /(^|\/)\.gitlab-ci\.yml$|(^|\/)Jenkinsfile$|(^|\/)\.circleci\//,
+  /(auth|login|session|oauth|jwt|password|billing|payment|stripe|paystack|payfast|checkout|subscription|invoice)/i,
+  /(^|\/)(migrations?|schema)(\/|\.sql$|\.prisma$)/i,
+  /(^|\/)(Dockerfile|docker-compose[^/]*\.ya?ml)$/,
+  /(installer|auto-?updat|release)[^/]*$/i,
+  /(^|\/)\.env(\.|$)|(secrets?|credentials?)/i,
+]
+const DOCS_ONLY = /\.(md|mdx|txt|rst)$|(^|\/)docs?\//i
+
+// ---------- small helpers ----------
+
+async function sha(text: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
+}
+
+function clip(s: unknown, n: number): string {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim()
+  return t.length > n ? t.slice(0, n - 1) + '…' : t
+}
+
+function tail(s: string, lines: number): string {
+  const all = s.replace(/\r/g, '').split('\n').filter(l => l.trim())
+  return all.slice(-lines).join('\n')
+}
+
+function kTokens(n: number): string {
+  return n < 1000 ? String(n) : (n / 1000).toFixed(n < 10000 ? 1 : 0) + 'k'
+}
+
+function secs(ms: number): string {
+  const s = Math.round(ms / 1000)
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'
+}
+
+function globToRegExp(glob: string): RegExp {
+  const esc = glob.trim().replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\u0000/g, '.*').replace(/\?/g, '.')
+  return new RegExp('(^|/)' + esc + '($|/)')
+}
+
+async function sh($: any, argv: string[], init: Record<string, unknown> = {}) {
+  try {
+    const r = await $.process.run(argv, { timeoutMs: 30000, ...init })
+    return { exitCode: r.exitCode as number, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''), timedOut: false }
+  } catch (err: any) {
+    return { exitCode: 124, stdout: '', stderr: String(err?.message ?? err), timedOut: true }
+  }
+}
+
+function usageOf(r: any): number {
+  const u = r?.usage
+  if (!u) return 0
+  return (u.input_tokens || 0) + (u.output_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0)
+}
+
+function parseJsonArray(text: string): any[] {
+  const t = String(text ?? '').replace(/```(?:json)?/g, '')
+  const a = t.indexOf('[')
+  const b = t.lastIndexOf(']')
+  if (a < 0 || b <= a) return []
+  try {
+    const v = JSON.parse(t.slice(a, b + 1))
+    return Array.isArray(v) ? v : []
+  } catch {
+    return []
+  }
+}
+
+function parseJsonObject(text: string): any {
+  const t = String(text ?? '').replace(/```(?:json)?/g, '')
+  const a = t.indexOf('{')
+  const b = t.lastIndexOf('}')
+  if (a < 0 || b <= a) return {}
+  try {
+    return JSON.parse(t.slice(a, b + 1)) ?? {}
+  } catch {
+    return {}
+  }
+}
+
+// ---------- the store: one record per project root ----------
+
+async function loadProjects($: any): Promise<Record<string, Project>> {
+  const saved = await $.store.get(STORE_KEY)
+  return saved && typeof saved === 'object' ? (saved as Record<string, Project>) : {}
+}
+
+async function loadProject($: any, root: string): Promise<Project> {
+  const all = await loadProjects($)
+  return all[root] ?? { rounds: {}, tokens: 0, runs: 0, lastAt: 0, findings: [] }
+}
+
+async function saveProject($: any, root: string, project: Project) {
+  const all = await loadProjects($)
+  all[root] = project
+  // keep the store small: the 12 most recently used projects
+  const keys = Object.keys(all).sort((a, b) => (all[b]?.lastAt ?? 0) - (all[a]?.lastAt ?? 0))
+  for (const k of keys.slice(12)) delete all[k]
+  await $.store.set(STORE_KEY, all)
+}
+
+// ---------- git: what would be pushed, plus the working tree ----------
+
+async function snapshot($: any, cwd: string): Promise<Snapshot> {
+  const none: Snapshot = { isRepo: false, root: cwd, head: null, branch: '', baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false }
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return none
+  const root = top.stdout.trim()
+  const g = (...a: string[]) => sh($, ['git', ...a], { cwd: root })
+  const headR = await g('rev-parse', 'HEAD')
+  const head = headR.exitCode === 0 ? headR.stdout.trim() : null
+  const branchR = await g('rev-parse', '--abbrev-ref', 'HEAD')
+  const branch = branchR.exitCode === 0 ? branchR.stdout.trim() : 'HEAD'
+
+  // the base: the upstream, else main/master; the diff runs from the merge-base
+  let base: string | null = null
+  let baseName: string | null = null
+  if (head) {
+    const up = await g('rev-parse', '--abbrev-ref', '@{upstream}')
+    const candidates = up.exitCode === 0 && up.stdout.trim() ? [up.stdout.trim()] : []
+    candidates.push('origin/main', 'origin/master', 'main', 'master')
+    for (const c of candidates) {
+      if (c === branch) continue
+      const v = await g('rev-parse', '--verify', '--quiet', c + '^{commit}')
+      if (v.exitCode !== 0) continue
+      const mb = await g('merge-base', c, 'HEAD')
+      if (mb.exitCode === 0 && mb.stdout.trim()) {
+        base = mb.stdout.trim()
+        baseName = c
+        break
+      }
+    }
+  }
+  const from = base ?? head
+  let diff = ''
+  if (from) {
+    const d = await g('diff', from, '--no-color', '--no-ext-diff', '--')
+    diff = d.stdout
+  }
+  const dirtyR = await g('status', '--porcelain')
+  const dirty = dirtyR.stdout.trim().length > 0
+  const un = await g('ls-files', '--others', '--exclude-standard')
+  const untracked = un.stdout.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 40)
+  for (const f of untracked) {
+    if (GENERATED.test(f)) continue
+    const d = await g('diff', '--no-index', '--no-color', '--', '/dev/null', f)
+    if (d.stdout) diff += (diff && !diff.endsWith('\n') ? '\n' : '') + d.stdout
+  }
+  let ahead = 0
+  if (base && head && base !== head) {
+    const c = await g('rev-list', '--count', base + '..HEAD')
+    ahead = Number(c.stdout.trim()) || 0
+  }
+  return { isRepo: true, root, head, branch, baseName, ahead, diff, untracked: untracked.length, dirty }
+}
+
+type FileDiff = { file: string; text: string; hash: string; added: number; removed: number }
+
+async function splitDiff(diff: string): Promise<FileDiff[]> {
+  const parts = diff.split(/\n(?=diff --git )/).filter(p => p.startsWith('diff --git'))
+  const out: FileDiff[] = []
+  for (const text of parts) {
+    const m = /^diff --git a\/(.+?) b\/(.+)$/m.exec(text)
+    const file = m ? m[2]! : '?'
+    let added = 0
+    let removed = 0
+    for (const line of text.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) added++
+      else if (line.startsWith('-') && !line.startsWith('---')) removed++
+    }
+    out.push({ file, text, hash: await sha(text), added, removed })
+  }
+  return out
+}
+
+function scopeLine(s: Snapshot): string {
+  const bits: string[] = []
+  if (s.ahead > 0 && s.baseName) bits.push(`${s.ahead} commit${s.ahead === 1 ? '' : 's'} ahead of ${s.baseName}`)
+  if (s.dirty) bits.push('working tree changes')
+  return bits.join(' + ') || 'no changes'
+}
+
+// ---------- REVIEW.md ----------
+
+const REVIEW_TEMPLATE = `# REVIEW.md
+
+What matters when reviewing changes in this project. The reviewer reads this
+file on every run. Keep it short: say what failure looks like here, cap the
+nits, and ask for evidence (a file and line) rather than a guess.
+
+## What failure looks like
+- A wrong result the user sees (be specific to this project)
+- A change that breaks an existing flow without a test catching it
+
+## Watch for
+- (lessons go here: /land learn "<note>")
+
+## Skip
+- Generated files, lockfiles, snapshots
+
+## Always human
+- (globs that always need a person: e.g. src/billing/**)
+
+## Checks
+- (optional: commands to run as evidence, one per line, e.g. npm test)
+`
+
+type ReviewMd = { text: string; checks: string[]; alwaysHuman: RegExp[]; skip: RegExp[]; path: string | null }
+
+async function readReviewMd($: any, root: string): Promise<ReviewMd> {
+  const empty: ReviewMd = { text: '', checks: [], alwaysHuman: [], skip: [], path: null }
+  for (const p of [root + '/REVIEW.md', root + '/.claude/REVIEW.md']) {
+    let text = ''
+    try {
+      if (!(await $.fs.exists(p))) continue
+      text = String(await $.fs.read(p))
+    } catch {
+      continue
+    }
+    const section = (name: string) => {
+      const m = new RegExp('^##\\s+' + name + '\\s*$([\\s\\S]*?)(?=^##\\s|\\s*$(?![\\s\\S]))', 'im').exec(text)
+      return m ? m[1]!.split('\n').map(l => l.replace(/^\s*[-*]\s*/, '').trim()).filter(l => l && !l.startsWith('(')) : []
+    }
+    return {
+      text: text.slice(0, 4000),
+      checks: section('Checks'),
+      alwaysHuman: section('Always human').map(globToRegExp),
+      skip: section('Skip').map(globToRegExp),
+      path: p,
+    }
+  }
+  return empty
+}
+
+// ---------- layer 1: the project's own checks (zero tokens) ----------
+
+async function detectChecks($: any, root: string, review: ReviewMd, depth: Depth): Promise<string[]> {
+  if (review.checks.length) return review.checks
+  const exists = async (p: string) => {
+    try {
+      return await $.fs.exists(root + '/' + p)
+    } catch {
+      return false
+    }
+  }
+  const cmds: string[] = []
+  if (await exists('package.json')) {
+    let scripts: Record<string, string> = {}
+    try {
+      scripts = JSON.parse(String(await $.fs.read(root + '/package.json'))).scripts ?? {}
+    } catch {
+      scripts = {}
+    }
+    const pm = (await exists('pnpm-lock.yaml')) ? 'pnpm' : (await exists('yarn.lock')) ? 'yarn' : (await exists('bun.lockb')) || (await exists('bun.lock')) ? 'bun' : 'npm'
+    const run = (s: string) => (pm === 'npm' ? `npm run ${s}` : `${pm} run ${s}`)
+    for (const s of ['typecheck', 'type-check', 'tsc', 'lint', 'test']) if (scripts[s]) cmds.push(run(s))
+    if (depth === 'deep' && scripts.build) cmds.push(run('build'))
+    if (!scripts.typecheck && !scripts['type-check'] && !scripts.tsc && (await exists('tsconfig.json'))) cmds.unshift('npx tsc --noEmit -p .')
+  } else if (await exists('Cargo.toml')) {
+    cmds.push('cargo check', 'cargo test')
+  } else if (await exists('go.mod')) {
+    cmds.push('go vet ./...', 'go test ./...')
+  } else if ((await exists('pyproject.toml')) || (await exists('pytest.ini')) || (await exists('setup.py'))) {
+    cmds.push('python -m pytest -q')
+  } else if (await exists('Makefile')) {
+    let mk = ''
+    try {
+      mk = String(await $.fs.read(root + '/Makefile'))
+    } catch {
+      mk = ''
+    }
+    for (const t of ['lint', 'test']) if (new RegExp('^' + t + ':', 'm').test(mk)) cmds.push('make ' + t)
+  }
+  return cmds
+}
+
+async function runChecks($: any, root: string, cmds: string[], onStep: (s: string) => void): Promise<Evidence[]> {
+  const out: Evidence[] = []
+  for (const cmd of cmds) {
+    onStep('checks: ' + clip(cmd, 40))
+    const started = Date.now()
+    const r = await sh($, ['sh', '-lc', cmd], { cwd: root, timeoutMs: 5 * 60 * 1000, env: { CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' } })
+    const ok = r.exitCode === 0
+    out.push({ cmd, ok, ms: Date.now() - started, tail: r.timedOut ? '(timed out after 5 minutes)' : tail(ok ? r.stdout + '\n' + r.stderr : r.stderr + '\n' + r.stdout, ok ? 3 : 25) })
+    if (!ok) break // one failed check is enough evidence; the rest wait for the fix
+  }
+  return out
+}
+
+// ---------- layer 2: the risk tier, from the change ----------
+
+async function riskTier($: any, model: string, files: FileDiff[], review: ReviewMd, spend: (r: any) => void): Promise<{ tier: Tier; why: string }> {
+  const names = files.map(f => f.file)
+  const hit = names.find(n => ALWAYS_HUMAN.some(re => re.test(n)) || review.alwaysHuman.some(re => re.test(n)))
+  if (hit) return { tier: 'high', why: `${hit} is a path that always needs a person` }
+  if (names.length && names.every(n => DOCS_ONLY.test(n))) return { tier: 'low', why: 'docs and copy only' }
+  const stat = files.map(f => `${f.file} +${f.added} -${f.removed}`).join('\n').slice(0, 3000)
+  const r = await $.model.complete({
+    model,
+    system: '[review-layers:tier] You set the risk tier of a code change from its file list and line counts. Answer with one word: low, medium or high. low: internal-only, additive, docs, tests, config of no consequence. high: billing, auth, data migrations, release or install paths, CI, anything that can lose data or lock users out. Otherwise medium.',
+    prompt: stat,
+    maxTokens: 5,
+    effort: 'low',
+    timeoutMs: 30000,
+  })
+  spend(r)
+  const word = r.isAnswered ? r.text.toLowerCase() : ''
+  const tier: Tier = word.includes('high') ? 'high' : word.includes('low') ? 'low' : 'medium'
+  return { tier, why: r.isAnswered ? 'set by the classifier from the change' : 'medium by default (classifier did not answer)' }
+}
+
+// ---------- layers 3 to 5: hunters, verifiers, security ----------
+
+const LENSES: Record<Lens, string> = {
+  correctness:
+    'Lens: CORRECTNESS. Does the change do what it says, at the root cause? Logic errors, wrong conditions, off-by-one, wrong types or units, broken control flow, a bug fix that patches a symptom, code paths the change leaves inconsistent.',
+  edges:
+    'Lens: EDGES AND REGRESSIONS. Empty, null, missing or malformed input; error handling that swallows or mis-reports; concurrency and ordering; state left half-updated; callers elsewhere in the repo that the change breaks; behaviour the tests in the diff do not cover.',
+  security:
+    'Lens: SECURITY. Injection (SQL, shell, HTML, path), missing auth or ownership checks, secrets or keys in code, data exposed to the wrong user, unsafe deserialisation, SSRF, open redirects, weakened crypto or validation, dependencies added without need.',
+}
+
+const HUNTER_SYSTEM =
+  '[review-layers:hunter] You are one of several parallel code reviewers. You read a unified diff and report BUGS ONLY, as evidence from the diff, never guesses from names. ' +
+  'Never report style, formatting, naming, comments, docs wording or cleanup. Never report something the diff shows is handled. ' +
+  'Each finding names the class of bug so the author can fix every instance, not one line. ' +
+  'Answer with a JSON array only, no prose: [{"file":"path","line":123,"severity":"important"|"nit"|"pre-existing","class":"short class, e.g. unchecked null from API","title":"one line","why":"two lines of evidence, quoting the diff","fix":"one line","instances":["path:line", ...]}]. ' +
+  '"important" would wrongly change behaviour or security; "nit" is a real but minor bug; "pre-existing" is a bug this change did not introduce. ' +
+  'An empty array [] is the right answer when there is nothing to fix; do not invent findings.'
+
+const VERIFIER_SYSTEM =
+  '[review-layers:verifier] You check one claimed bug against the diff hunk it came from. Be skeptical of the claim and of the code alike. ' +
+  'Answer JSON only: {"verdict":"real"|"not-real"|"pre-existing","why":"one line"}. "real" means a person who shipped this would get wrong behaviour or a security hole. "not-real" means the claim is wrong, the case is handled, or it is style.'
+
+function fingerprint(f: { file: string; cls: string; title: string }): string {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ').slice(0, 6).join(' ')
+  return `${f.file}|${norm(f.cls || f.title)}`
+}
+
+function pickModel(options: Record<string, unknown>, sessionModel: string, depth: Depth): string {
+  const chosen = String(options.model ?? 'haiku')
+  if (depth === 'deep') return sessionModel
+  return chosen === 'inherit' ? sessionModel : chosen
+}
+
+function budgetDiff(files: FileDiff[], max: number): { text: string; cut: number } {
+  const total = files.reduce((n, f) => n + f.text.length, 0)
+  if (total <= max) return { text: files.map(f => f.text).join('\n'), cut: 0 }
+  // trim the biggest files first so small, often more interesting, changes stay whole
+  const share = Math.max(2000, Math.floor(max / Math.max(1, files.length)))
+  let cut = 0
+  const parts = files.map(f => {
+    if (f.text.length <= share) return f.text
+    cut += f.text.length - share
+    return f.text.slice(0, share) + `\n[... review-layers cut ${f.text.length - share} characters of this file's diff]`
+  })
+  let text = parts.join('\n')
+  if (text.length > max) {
+    cut += text.length - max
+    text = text.slice(0, max) + '\n[... review-layers cut the rest of the diff]'
+  }
+  return { text, cut }
+}
+
+async function hunt($: any, args: {
+  model: string
+  depth: Depth
+  diffText: string
+  review: ReviewMd
+  focus: string
+  spend: (r: any) => void
+  onStep: (s: string) => void
+  signal?: AbortSignal
+}): Promise<{ raw: any[]; failed: number }> {
+  const lenses: Lens[] = args.depth === 'quick' ? ['correctness'] : ['correctness', 'edges', 'security']
+  const shared = [
+    { text: (args.review.text ? `<REVIEW.md>\n${args.review.text}\n</REVIEW.md>\n\n` : '') + `<diff>\n${args.diffText}\n</diff>`, cache: true },
+  ]
+  args.onStep(`hunters: ${lenses.length} reading the diff`)
+  const quick = args.depth === 'quick' ? ' Cover security too: injection, missing auth, secrets in code.' : ''
+  const calls = lenses.map(lens =>
+    $.model.complete(
+      {
+        model: args.model,
+        system: HUNTER_SYSTEM,
+        prompt: [...shared, { text: LENSES[lens] + quick + (args.focus ? ` The author asks you to focus on: ${args.focus}.` : '') + ' Reply with the JSON array now.' }],
+        maxTokens: args.depth === 'deep' ? 2500 : 1200,
+        effort: args.depth === 'deep' ? 'high' : 'medium',
+        timeoutMs: 180000,
+      },
+      args.signal ? { signal: args.signal } : undefined,
+    ).then((r: any) => ({ lens, r })),
+  )
+  const results = await Promise.all(calls)
+  const raw: any[] = []
+  let failed = 0
+  for (const { lens, r } of results) {
+    args.spend(r)
+    if (!r.isAnswered) {
+      failed++
+      continue
+    }
+    for (const f of parseJsonArray(r.text)) {
+      if (!f || typeof f !== 'object' || !f.file) continue
+      raw.push({ ...f, lens })
+    }
+  }
+  return { raw, failed }
+}
+
+function hunkFor(files: FileDiff[], file: string, line: number | null): string {
+  const f = files.find(x => x.file === file) ?? files.find(x => x.file.endsWith('/' + file) || file.endsWith('/' + x.file))
+  if (!f) return ''
+  if (f.text.length <= 6000 || line === null) return f.text.slice(0, 6000)
+  // the hunk that holds the line, by its @@ header
+  const hunks = f.text.split(/\n(?=@@ )/)
+  const head = hunks[0] ?? ''
+  for (const h of hunks.slice(1)) {
+    const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(h)
+    if (!m) continue
+    const start = Number(m[1])
+    const len = Number(m[2] ?? 1)
+    if (line >= start - 3 && line <= start + len + 3) return (head.split('\n').slice(0, 4).join('\n') + '\n' + h).slice(0, 6000)
+  }
+  return f.text.slice(0, 6000)
+}
+
+async function verify($: any, args: {
+  model: string
+  depth: Depth
+  files: FileDiff[]
+  raw: any[]
+  spend: (r: any) => void
+  onStep: (s: string) => void
+  signal?: AbortSignal
+}): Promise<{ votes: Map<any, { real: number; pre: number; of: number }> }> {
+  const votes = new Map<any, { real: number; pre: number; of: number }>()
+  const n = args.depth === 'quick' ? 0 : args.depth === 'deep' ? 3 : 2
+  if (n === 0 || args.raw.length === 0) return { votes }
+  args.onStep(`verifiers: ${n} votes on ${args.raw.length} finding${args.raw.length === 1 ? '' : 's'}`)
+  const calls: Promise<void>[] = []
+  for (const f of args.raw) {
+    const tally = { real: 0, pre: 0, of: n }
+    votes.set(f, tally)
+    const hunk = hunkFor(args.files, String(f.file), typeof f.line === 'number' ? f.line : null)
+    for (let i = 0; i < n; i++) {
+      calls.push(
+        $.model.complete(
+          {
+            model: args.model,
+            system: VERIFIER_SYSTEM,
+            prompt: `<hunk file="${f.file}">\n${hunk}\n</hunk>\n\nClaim (${f.severity ?? 'important'}, ${f.lens}): ${f.title}\nClass: ${f.class ?? ''}\nEvidence given: ${f.why ?? ''}\n\nVerdict JSON:`,
+            maxTokens: 120,
+            effort: 'low',
+            timeoutMs: 60000,
+          },
+          args.signal ? { signal: args.signal } : undefined,
+        ).then((r: any) => {
+          args.spend(r)
+          if (!r.isAnswered) {
+            tally.of-- // an unanswered verifier abstains
+            return
+          }
+          const v = String(parseJsonObject(r.text).verdict ?? '').toLowerCase()
+          if (v.startsWith('real')) tally.real++
+          else if (v.startsWith('pre')) tally.pre++
+        }),
+      )
+    }
+  }
+  await Promise.all(calls)
+  return { votes }
+}
+
+// ---------- the run: every layer in order ----------
+
+type RunArgs = { depth: Depth; focus: string; options: Record<string, unknown> }
+type RunResult = { text: string; context: string[]; view: View }
+
+let running: Promise<RunResult> | null = null
+
+async function land($: any, args: RunArgs): Promise<RunResult> {
+  if (running) return running
+  running = landOnce($, args).finally(() => {
+    running = null
+  })
+  return running
+}
+
+async function landOnce($: any, args: RunArgs): Promise<RunResult> {
+  const started = Date.now()
+  const cwd: string = await $.session.cwd()
+  let tokens = 0
+  const spend = (r: any) => {
+    tokens += usageOf(r)
+  }
+  const layers: Layer[] = [
+    { name: 'verify', state: 'wait', note: '' },
+    { name: 'risk tier', state: 'wait', note: '' },
+    { name: 'hunters', state: 'wait', note: '' },
+    { name: 'verifiers', state: 'wait', note: '' },
+    { name: 'security', state: 'wait', note: '' },
+    { name: 'converge', state: 'wait', note: '' },
+    { name: 'gate', state: 'wait', note: '' },
+  ]
+  const layer = (name: string, state: Layer['state'], note: string) => {
+    const l = layers.find(x => x.name === name)
+    if (l) {
+      l.state = state
+      l.note = note
+    }
+  }
+  let current: View = { root: cwd, status: 'running', line: 'review-layers: reading the changes', step: 'git', tier: null, round: 0, tokens: 0, needsApproval: false, approved: false, layers, findings: [], evidence: [] }
+  const show = async (step: string) => {
+    current = { ...current, step, tokens, layers: layers.map(l => ({ ...l })) }
+    $.ui.status(`land: ${step}`)
+    await update($, view, () => current)
+  }
+  await show('reading the changes')
+
+  const snap = await snapshot($, cwd)
+  if (!snap.isRepo) {
+    $.ui.status(undefined)
+    const v: View = { ...current, status: 'idle', line: 'review-layers: not a git repository', step: '' }
+    await update($, view, () => v)
+    return { text: 'review-layers: this folder is not a git repository, so there is nothing to land.', context: [], view: v }
+  }
+  const root = snap.root
+  const review = await readReviewMd($, root)
+  const project = await loadProject($, root)
+  const allFiles = await splitDiff(snap.diff)
+  const files = allFiles.filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
+  const diffHash = await sha(files.map(f => f.hash).join(','))
+  const family = `${snap.branch}`
+  const round: Round = project.rounds[family] ?? { count: 0, posted: {}, fileHashes: {}, resolved: {} }
+  const roundCap = Math.max(1, Number(args.options.roundCap ?? 3) || 3)
+
+  if (files.length === 0) {
+    $.ui.status(undefined)
+    const v: View = { ...current, root, status: 'idle', line: 'review-layers: nothing to review', step: '' }
+    await update($, view, () => v)
+    return { text: `review-layers: no changes to review on ${snap.branch} (${scopeLine(snap)}).`, context: [], view: v }
+  }
+
+  // a run on the very same changes repeats nothing: the last verdict stands
+  if (project.pass && project.pass.diffHash === diffHash && project.pass.status === 'green') {
+    $.ui.status(undefined)
+    const v = viewOf(root, project, snap, layers.map(l => ({ ...l, state: 'pass', note: 'unchanged since the last green run' })), [], tokens, round.count)
+    await update($, view, () => v)
+    return { text: `review-layers: these exact changes are already green (round ${round.count}, ${project.pass.tier} risk)${project.pass.approved || project.pass.tier === 'low' ? ', cleared to push.' : ': run /land approve to clear the push.'}`, context: [], view: v }
+  }
+
+  round.count += 1
+  current = { ...current, root, round: round.count }
+
+  // layer 1: verify, with the project's own checks
+  const cmds = await detectChecks($, root, review, args.depth)
+  let evidence: Evidence[] = []
+  if (cmds.length) {
+    layer('verify', 'run', '')
+    evidence = await runChecks($, root, cmds, s => void show(s))
+    const failed = evidence.find(e => !e.ok)
+    layer('verify', failed ? 'fail' : 'pass', failed ? `${clip(failed.cmd, 30)} failed` : `${evidence.length} check${evidence.length === 1 ? '' : 's'} green`)
+  } else {
+    layer('verify', 'skip', 'no checks found (add a ## Checks section to REVIEW.md)')
+  }
+  current = { ...current, evidence }
+
+  // layer 2: risk tier, from the change
+  await show('risk tier')
+  const sessionModel: string = await $.session.model()
+  const model = pickModel(args.options, sessionModel, args.depth)
+  const { tier, why } = await riskTier($, model === sessionModel ? 'haiku' : model, files, review, spend)
+  layer('risk tier', 'pass', `${tier}: ${why}`)
+  current = { ...current, tier }
+
+  // layers 3 to 5: hunters and verifiers, unless the round cap says step back
+  const checksFailed = evidence.some(e => !e.ok)
+  let findings: Finding[] = []
+  let repeats: Finding[] = []
+  let hunterNote = ''
+  const overCap = round.count > roundCap
+  if (overCap) {
+    layer('hunters', 'skip', `round ${round.count} is past the cap of ${roundCap}: step back`)
+    layer('verifiers', 'skip', '')
+    layer('security', 'skip', '')
+  } else if (checksFailed) {
+    layer('hunters', 'skip', 'checks failed first; fix those, then run again')
+    layer('verifiers', 'skip', '')
+    layer('security', 'skip', '')
+  } else {
+    // diff-only re-review after the first round: files whose diff is unchanged are not re-read
+    const changed = round.count > 1 ? files.filter(f => round.fileHashes[f.file] !== f.hash) : files
+    const budget = budgetDiff(changed, Math.max(5000, Number(args.options.maxDiffChars ?? 40000) || 40000))
+    if (changed.length === 0) {
+      layer('hunters', 'pass', 'nothing changed since the last round')
+      layer('verifiers', 'skip', '')
+    } else {
+      layer('hunters', 'run', '')
+      const { raw, failed } = await hunt($, { model, depth: args.depth, diffText: budget.text, review, focus: args.focus, spend, onStep: s => void show(s) })
+
+      // dedupe across hunters first, so a finding three hunters raised is verified once, not three times
+      const byFp = new Map<string, { f: any; seen: number }>()
+      for (const f of raw) {
+        const fp = fingerprint({ file: String(f.file), cls: String(f.class ?? ''), title: String(f.title ?? '') })
+        const had = byFp.get(fp)
+        if (had) {
+          had.seen++
+          if (!had.f.why && f.why) had.f = { ...f, lens: had.f.lens }
+          if (f.lens === 'security') had.f.lens = 'security'
+        } else byFp.set(fp, { f, seen: 1 })
+      }
+      const unique = [...byFp.entries()].map(([fp, x]) => ({ fp, ...x }))
+      const { votes } = await verify($, { model, depth: args.depth, files, raw: unique.map(u => u.f), spend, onStep: s => void show(s) })
+
+      let n = 0
+      let dropped = 0
+      for (const u of unique) {
+        const x = u.f
+        const v = votes.get(x) ?? { real: 0, pre: 0, of: 0 }
+        const sev: Finding['severity'] = x.severity === 'nit' ? 'nit' : x.severity === 'pre-existing' ? 'pre-existing' : 'important'
+        const confirmed = v.of === 0 ? true : v.real >= 1 || (u.seen > 1 && v.real + v.pre >= 1)
+        const styleOnly = /\b(style|format|naming|rename|comment|typo|whitespace|cleanup|refactor|readab)/i.test(String(x.class ?? '') + ' ' + String(x.title ?? ''))
+        if (!confirmed || (styleOnly && sev !== 'important')) {
+          dropped++
+          continue
+        }
+        const finding: Finding = {
+          n: 0,
+          file: String(x.file),
+          line: typeof x.line === 'number' ? x.line : null,
+          severity: v.pre > v.real ? 'pre-existing' : sev,
+          lens: x.lens,
+          cls: clip(x.class ?? '', 80),
+          title: clip(x.title ?? '', 140),
+          why: clip(x.why ?? '', 400),
+          fix: clip(x.fix ?? '', 200),
+          instances: Array.isArray(x.instances) ? x.instances.map((s: unknown) => clip(s, 80)).slice(0, 12) : [],
+          votes: v.real + (u.seen - 1),
+          of: v.of + (u.seen - 1),
+          status: round.resolved[u.fp] ? 'resolved' : round.posted[u.fp] ? 'repeat' : 'open',
+          fp: u.fp,
+        }
+        if (finding.status === 'resolved') continue
+        if (finding.status === 'repeat') {
+          repeats.push(finding)
+          continue
+        }
+        finding.n = ++n
+        findings.push(finding)
+      }
+      const order = { important: 0, nit: 1, 'pre-existing': 2 }
+      findings.sort((a, b) => order[a.severity] - order[b.severity] || b.votes - a.votes)
+      findings.forEach((f, i) => (f.n = i + 1))
+      hunterNote = `${raw.length} raised (${unique.length} distinct), ${findings.length} confirmed, ${dropped} dropped${repeats.length ? `, ${repeats.length} still open from earlier rounds` : ''}${failed ? `, ${failed} hunter${failed === 1 ? '' : 's'} did not answer` : ''}${budget.cut ? `, diff trimmed by ${kTokens(budget.cut)} chars` : ''}`
+      layer('hunters', findings.length || repeats.length ? 'fail' : 'pass', hunterNote)
+      layer('verifiers', 'pass', args.depth === 'quick' ? 'skipped at quick depth' : `${votes.size ? 'voted' : 'nothing to vote on'}`)
+      for (const f of findings) round.posted[f.fp] = round.count
+    }
+    const sec = [...findings, ...repeats].filter(f => f.lens === 'security' && f.severity !== 'pre-existing')
+    layer('security', sec.length ? 'fail' : 'pass', sec.length ? `${sec.length} open` : 'clean')
+    for (const f of files) round.fileHashes[f.file] = f.hash
+  }
+
+  // layer 6: converge
+  const open = [...findings, ...repeats].filter(f => f.severity === 'important' || f.lens === 'security')
+  const nits = findings.filter(f => f.severity === 'nit').length
+  layer('converge', overCap ? 'fail' : open.length ? 'run' : 'pass', overCap ? `${round.count} rounds: reconsider the approach` : `round ${round.count} of ${roundCap}`)
+
+  // layer 7: the gate's verdict
+  const status: Pass['status'] = checksFailed || open.length || overCap ? 'red' : 'green'
+  const needsApproval = needsPerson(tier)
+  const prior = project.pass && project.pass.diffHash === diffHash ? project.pass : undefined
+  const pass: Pass = {
+    diffHash,
+    head: snap.head,
+    tier,
+    status,
+    approved: prior?.approved ?? false,
+    note: prior?.note ?? '',
+    at: Date.now(),
+    open: open.length,
+    scope: scopeLine(snap),
+    humanTouches: prior?.humanTouches ?? 0,
+  }
+  layer('gate', status === 'green' ? (needsApproval && !pass.approved ? 'run' : 'pass') : 'fail', status === 'green' ? (needsApproval && !pass.approved ? `${tier} risk: /land approve to clear the push` : 'cleared to push') : 'push blocked until green')
+
+  project.pass = pass
+  project.rounds[family] = round
+  project.tokens += tokens
+  project.runs += 1
+  project.lastAt = Date.now()
+  project.findings = [...findings, ...repeats].map(f => ({ ...f }))
+  await saveProject($, root, project)
+
+  const v = viewOf(root, project, snap, layers, [...findings, ...repeats], tokens, round.count, evidence)
+  await update($, view, () => v)
+  $.ui.status(undefined)
+  void $.ui.open({ id: PANE, title: 'Review layers' })
+
+  // the report
+  const lines: string[] = []
+  const head = status === 'green' ? `GREEN: ${tier} risk, round ${round.count}` : overCap ? `STEP BACK: ${round.count} rounds on ${snap.branch} without converging` : `RED: ${open.length} open finding${open.length === 1 ? '' : 's'}${checksFailed ? ', checks failing' : ''}`
+  lines.push(`review-layers · ${head} · ${snap.branch} (${scopeLine(snap)}) · ${files.length} file${files.length === 1 ? '' : 's'} · ${kTokens(tokens)} tokens · ${secs(Date.now() - started)}`)
+  for (const l of layers) lines.push(`  ${mark(l.state)} ${l.name.padEnd(10)} ${l.note}`)
+  for (const e of evidence) lines.push(`\n$ ${e.cmd}  (${e.ok ? 'ok' : 'FAILED'}, ${secs(e.ms)})\n${e.tail.split('\n').map(x => '  ' + x).join('\n')}`)
+  if (findings.length || repeats.length) {
+    lines.push('')
+    for (const f of [...findings, ...repeats]) lines.push(formatFinding(f))
+  }
+  if (nits && !open.length) lines.push(`\n${nits} nit${nits === 1 ? '' : 's'} listed above do not block.`)
+  if (overCap) lines.push(`\nThree-plus rounds usually means the approach, not the code, is the problem. Reconsider it with the person, or /land reset to start the count over on purpose.`)
+  if (status === 'green' && needsApproval && !pass.approved) lines.push(`\n${tier === 'high' ? 'High' : 'Medium'} risk: a person reads the evidence above and runs /land approve${tier === 'high' ? ' <note>' : ''} before this can be pushed.`)
+  if (status === 'green' && (!needsApproval || pass.approved)) lines.push(`\nCleared: ${tier} risk${tier === 'medium' ? ' (you prompted it, so you are its reviewer)' : ''} needs no${pass.approved ? ' further' : ''} typed approval. git push and gh pr create will go through.`)
+  if (open.length) lines.push(`\nEvery finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).`)
+
+  const context: string[] = []
+  if (open.length)
+    context.push(
+      `review-layers posted ${open.length} verified finding(s) above. Fix each at its root cause and every instance of its class, not only the line named. If one is wrong or intentional, tell the user and suggest \`/land resolve <n> <reason>\`; do not silently skip it. Run the project's checks and show their output, then call the ${TOOL} tool (or ask the user to run /land) to re-review. Do not git push until it is green.`,
+    )
+  else if (checksFailed) context.push(`review-layers: a check failed (see above). Fix the cause, show the passing output, then re-run the review with the ${TOOL} tool.`)
+  return { text: lines.join('\n'), context, view: v }
+}
+
+function fixPrompt(open: Finding[]): string {
+  return `review-layers found these verified findings on the current changes:\n\n${open.map(formatFinding).join('\n')}\n\nFix each at its root cause and every instance of its class, not only the line named. If one is wrong or intentional, say so and suggest /land resolve <n> <reason> instead of changing the code. Run the project's checks and show their output, then call the ${TOOL} tool to re-review. Do not push until it is green.`
+}
+
+function mark(state: Layer['state']): string {
+  return state === 'pass' ? '✓' : state === 'fail' ? '✗' : state === 'run' ? '▸' : state === 'skip' ? '–' : '·'
+}
+
+function formatFinding(f: Finding): string {
+  const where = f.line ? `${f.file}:${f.line}` : f.file
+  const tag = f.severity === 'important' ? 'IMPORTANT' : f.severity === 'nit' ? 'nit' : 'pre-existing'
+  const votes = f.of ? ` (${f.votes}/${f.of} votes)` : ''
+  const more = f.instances.length > 1 ? `\n   also: ${f.instances.filter(i => !i.startsWith(where)).slice(0, 6).join(', ')}` : ''
+  return `${f.n ? f.n + '.' : '  '} [${tag}${f.lens === 'security' ? ', security' : ''}${f.status === 'repeat' ? ', still open' : ''}] ${where}: ${f.title}${votes}\n   class: ${f.cls}\n   why: ${f.why}\n   fix: ${f.fix}${more}`
+}
+
+function viewOf(root: string, project: Project, snap: Snapshot, layers: Layer[], findings: Finding[], tokens: number, round: number, evidence: Evidence[] = []): View {
+  const pass = project.pass
+  const needsApproval = !!pass && needsPerson(pass.tier)
+  const status: View['status'] = !pass ? 'idle' : pass.status === 'green' ? (needsApproval && !pass.approved ? 'amber' : 'green') : 'red'
+  const line = !pass
+    ? 'review-layers: not run yet'
+    : status === 'green'
+      ? `land ✓ green · ${pass.tier} risk · cleared to push`
+      : status === 'amber'
+        ? `land ✓ green · ${pass.tier} risk · needs /land approve`
+        : `land ✗ ${pass.open} open · round ${round}`
+  return { root, status, line, step: '', tier: pass?.tier ?? null, round, tokens, needsApproval, approved: pass?.approved ?? false, layers: layers.map(l => ({ ...l })), findings, evidence }
+}
+
+// ---------- the gate: what a push or a PR needs ----------
+
+const PUSH = /(^|[;&|(]\s*)git\s+(?:-C\s+\S+\s+)?(?:[-\w]+\s+)*push\b/
+const PR = /(^|[;&|(]\s*)gh\s+pr\s+(create|merge)\b/
+
+async function gateVerdict($: any, options: Record<string, unknown>, command: string): Promise<{ deny?: string; warn?: string }> {
+  const mode = String(options.gate ?? 'block')
+  if (mode === 'off') return {}
+  if (!PUSH.test(command) && !PR.test(command)) return {}
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return {}
+  const root = top.stdout.trim()
+  const project = (await loadProjects($))[root]
+  const review = await readReviewMd($, root)
+  if (!project && !review.path) return {} // a project that never opted in is left alone
+  const what = PR.test(command) ? 'opening or merging a PR' : 'a push'
+  const say = (why: string) => (mode === 'warn' ? { warn: why } : { deny: `review-layers: ${why}` })
+  if (!project?.pass) return say(`${what} waits for /land: these changes have not been reviewed.`)
+  const snap = await snapshot($, cwd)
+  const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
+  const diffHash = await sha(files.map(f => f.hash).join(','))
+  const pass = project.pass
+  if (files.length && pass.diffHash !== diffHash) return say(`${what} waits for /land: the changes differ from the ones last reviewed (${new Date(pass.at).toLocaleTimeString('en-ZA')}).`)
+  if (pass.status !== 'green') return say(`${what} is blocked: the last /land was red with ${pass.open} open finding(s). Fix or /land resolve them, then run /land.`)
+  if (needsPerson(pass.tier) && !pass.approved) return say(`${what} waits for a person: ${pass.tier} risk needs /land approve${pass.tier === 'high' ? ' <note>' : ''} after reading the evidence.`)
+  return {}
+}
+
+// a push that went through is a landing: count whether a person had to touch it
+async function countLanding($: any, command: string) {
+  if (!PUSH.test(command) && !PR.test(command)) return
+  try {
+    const cwd: string = await $.session.cwd()
+    const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+    if (top.exitCode !== 0) return
+    const root = top.stdout.trim()
+    const project = (await loadProjects($))[root]
+    if (!project?.pass || project.pass.status !== 'green') return
+    const h = humanOf(project)
+    h.landings++
+    if (!project.pass.humanTouches) h.landingsNoPerson++
+    project.pass.humanTouches = 0
+    await saveProject($, root, project)
+  } catch {
+    // the count is a nicety
+  }
+}
+
+// ---------- commands ----------
+
+async function cmdStatus($: any): Promise<string> {
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return 'review-layers: not a git repository.'
+  const root = top.stdout.trim()
+  const project = (await loadProjects($))[root]
+  const snap = await snapshot($, cwd)
+  const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file))
+  const hash = await sha(files.map(f => f.hash).join(','))
+  const round = project?.rounds[snap.branch]?.count ?? 0
+  if (!project?.pass) return `review-layers: ${snap.branch} (${scopeLine(snap)}), ${files.length} file(s) changed, not reviewed yet. Run /land.`
+  const p = project.pass
+  const same = p.diffHash === hash
+  return [
+    `review-layers: ${snap.branch} (${scopeLine(snap)}), ${files.length} file(s) changed, round ${round}.`,
+    `last run: ${p.status.toUpperCase()}, ${p.tier} risk, ${p.open} open, ${same ? 'same changes' : 'CHANGES DIFFER since then: run /land again'}, ${p.approved ? 'approved' + (p.note ? ' (' + p.note + ')' : '') : !needsPerson(p.tier) ? 'no typed approval needed' : 'not yet approved'}.`,
+    `project totals: ${project.runs} run(s), ${kTokens(project.tokens)} tokens. human time: ${humanOf(project).landings} landing(s), ${humanOf(project).landingsNoPerson} with no person in the loop, ${humanOf(project).approvals} approval(s), ${humanOf(project).resolves} resolve(s) typed.`,
+  ].join('\n')
+}
+
+async function cmdApprove($: any, note: string): Promise<string> {
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return 'review-layers: not a git repository.'
+  const root = top.stdout.trim()
+  const project = await loadProject($, root)
+  if (!project.pass) return 'Nothing to approve: run /land first.'
+  if (project.pass.status !== 'green') return `Not green yet: ${project.pass.open} open finding(s). Fix or resolve them and run /land again before approving.`
+  if (project.pass.tier === 'high' && !note) return 'High risk needs a note saying what you checked: /land approve <note>.'
+  project.pass.approved = true
+  project.pass.note = note
+  project.pass.humanTouches = (project.pass.humanTouches ?? 0) + 1
+  humanOf(project).approvals++
+  await saveProject($, root, project)
+  const snapLite = { root, head: project.pass.head, branch: '', baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false, isRepo: true }
+  await update($, view, v => (v ? { ...viewOf(root, project, snapLite, v.layers, v.findings, v.tokens, v.round, v.evidence) } : v))
+  return `Approved (${project.pass.tier} risk${note ? ': ' + note : ''}). You own this change: push and PR will go through.`
+}
+
+async function cmdResolve($: any, args: string): Promise<string> {
+  const m = /^(\d+)\s+(.+)$/s.exec(args.trim())
+  if (!m) return 'Say which and why: /land resolve <n> <reason>'
+  const n = Number(m[1])
+  const reason = m[2]!.trim()
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return 'review-layers: not a git repository.'
+  const root = top.stdout.trim()
+  const project = await loadProject($, root)
+  const f = project.findings.find(x => x.n === n)
+  if (!f) return `No finding ${n} in the last run.`
+  const branch = (await sh($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root })).stdout.trim()
+  const round = project.rounds[branch] ?? { count: 0, posted: {}, fileHashes: {}, resolved: {} }
+  round.resolved[f.fp] = reason
+  project.rounds[branch] = round
+  f.status = 'resolved'
+  humanOf(project).resolves++
+  if (project.pass) project.pass.humanTouches = (project.pass.humanTouches ?? 0) + 1
+  const stillOpen = project.findings.filter(x => x.status !== 'resolved' && (x.severity === 'important' || x.lens === 'security'))
+  if (project.pass) {
+    project.pass.open = stillOpen.length
+    if (!stillOpen.length && project.pass.status === 'red' && !project.findings.some(x => x.status !== 'resolved' && x.severity === 'important')) project.pass.status = 'green'
+    if (project.pass.status === 'green' && !needsPerson(project.pass.tier)) project.pass.approved = project.pass.approved || false
+  }
+  await saveProject($, root, project)
+  const nowGreen = project.pass?.status === 'green'
+  const nextStatus: View['status'] = nowGreen ? (project.pass && needsPerson(project.pass.tier) && !project.pass.approved ? 'amber' : 'green') : 'red'
+  await update($, view, v => (v ? { ...v, findings: project.findings, status: nextStatus, line: nowGreen ? `land ✓ green · ${project.pass!.tier} risk` : v.line } : v))
+  return `Resolved ${n} (${f.title}): ${reason}. It will not be posted again on this branch.${stillOpen.length ? ` ${stillOpen.length} still open.` : project.pass?.status === 'green' ? ' Nothing else open: green.' : ' Run /land to confirm.'}`
+}
+
+async function cmdLearn($: any, note: string): Promise<string> {
+  if (!note) return 'What should the reviewer watch for? /land learn <note>'
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  const root = top.exitCode === 0 ? top.stdout.trim() : cwd
+  const review = await readReviewMd($, root)
+  const path = review.path ?? root + '/REVIEW.md'
+  let text = ''
+  try {
+    text = review.path ? String(await $.fs.read(review.path)) : REVIEW_TEMPLATE
+  } catch {
+    text = REVIEW_TEMPLATE
+  }
+  const line = `- ${note.trim()}`
+  if (/^## Watch for\s*$/m.test(text)) text = text.replace(/^(## Watch for\s*\n)([\s\S]*?)(?=\n## |\s*$)/m, (_m, h, body) => h + body.replace(/\n?$/, '\n') + line)
+  else text = text.replace(/\s*$/, '') + '\n\n## Watch for\n' + line + '\n'
+  await $.fs.write(path, text)
+  return `Added to ${path.replace(root + '/', '')} under "Watch for": ${note.trim()}`
+}
+
+async function cmdInit($: any): Promise<string> {
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  const root = top.exitCode === 0 ? top.stdout.trim() : cwd
+  const review = await readReviewMd($, root)
+  if (review.path) return `${review.path} already exists.`
+  await $.fs.write(root + '/REVIEW.md', REVIEW_TEMPLATE)
+  return 'Wrote REVIEW.md. Edit it to say what failure looks like in this project; the reviewer reads it on every run, and the gate is now on for this project.'
+}
+
+type Incident = { sha: string; what: string; at: number }
+
+async function incidentsPath($: any, root: string) {
+  return root + '/.review-layers/incidents.json'
+}
+
+async function loadIncidents($: any, root: string): Promise<Incident[]> {
+  try {
+    const p = await incidentsPath($, root)
+    if (!(await $.fs.exists(p))) return []
+    const v = JSON.parse(String(await $.fs.read(p)))
+    return Array.isArray(v) ? v : []
+  } catch {
+    return []
+  }
+}
+
+async function cmdIncident($: any, args: string): Promise<string> {
+  const m = /^([0-9a-f]{6,40})\s+(.+)$/is.exec(args.trim())
+  if (!m) return 'Name the commit that broke something and what broke: /land incident <commit> <what broke>'
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return 'review-layers: not a git repository.'
+  const root = top.stdout.trim()
+  const ok = await sh($, ['git', 'rev-parse', '--verify', '--quiet', m[1] + '^{commit}'], { cwd: root })
+  if (ok.exitCode !== 0) return `No commit ${m[1]} here.`
+  const list = await loadIncidents($, root)
+  list.push({ sha: ok.stdout.trim(), what: m[2]!.trim(), at: Date.now() })
+  await $.fs.write(await incidentsPath($, root), JSON.stringify(list, null, 2) + '\n')
+  return `Incident ${list.length} recorded in .review-layers/incidents.json (commit it: it is the eval set). /land eval scores the reviewer against all ${list.length}.`
+}
+
+async function cmdEval($: any, options: Record<string, unknown>): Promise<string> {
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return 'review-layers: not a git repository.'
+  const root = top.stdout.trim()
+  const list = await loadIncidents($, root)
+  if (!list.length) return 'No incidents yet. Add the commits that broke something: /land incident <commit> <what broke>'
+  const review = await readReviewMd($, root)
+  const sessionModel: string = await $.session.model()
+  const model = pickModel(options, sessionModel, 'standard')
+  let tokens = 0
+  const spend = (r: any) => {
+    tokens += usageOf(r)
+  }
+  let caught = 0
+  const rows: string[] = []
+  for (const [i, inc] of list.entries()) {
+    $.ui.status(`land eval: ${i + 1}/${list.length}`)
+    const show = await sh($, ['git', 'show', inc.sha, '--format=', '--no-color', '--patch'], { cwd: root, timeoutMs: 60000 })
+    const files = (await splitDiff(show.stdout)).filter(f => !GENERATED.test(f.file))
+    const budget = budgetDiff(files, Math.max(5000, Number(options.maxDiffChars ?? 40000) || 40000))
+    const { raw } = await hunt($, { model, depth: 'standard', diffText: budget.text, review, focus: '', spend, onStep: () => {} })
+    let hit = false
+    if (raw.length) {
+      const judge = await $.model.complete({
+        model: 'haiku',
+        system: '[review-layers:judge] Did any of the listed review findings catch the incident described? Answer one word: yes or no.',
+        prompt: `Incident: ${inc.what}\n\nFindings:\n${raw.map(f => `- ${f.file}:${f.line ?? '?'} ${f.title} (${f.class ?? ''})`).join('\n').slice(0, 4000)}`,
+        maxTokens: 3,
+        effort: 'low',
+        timeoutMs: 30000,
+      })
+      spend(judge)
+      hit = judge.isAnswered && /yes/i.test(judge.text)
+    }
+    if (hit) caught++
+    rows.push(`  ${hit ? '✓' : '✗'} ${inc.sha.slice(0, 7)} ${clip(inc.what, 70)} (${raw.length} raised)`)
+  }
+  $.ui.status(undefined)
+  const score = `${caught}/${list.length}`
+  const project = await loadProject($, root)
+  const prev = (project as any).evalScore as string | undefined
+  ;(project as any).evalScore = score
+  project.tokens += tokens
+  await saveProject($, root, project)
+  return `review-layers eval: the reviewer caught ${score} past incidents${prev ? ` (was ${prev})` : ''} · ${kTokens(tokens)} tokens\n${rows.join('\n')}\n\nA miss means the reviewer lacked something: add it to REVIEW.md (/land learn) and run /land eval again. Keep a change to the reviewer only when the score holds.`
+}
+
+async function cmdPr($: any): Promise<{ text: string; context?: string[] }> {
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return { text: 'review-layers: not a git repository.' }
+  const root = top.stdout.trim()
+  const project = (await loadProjects($))[root]
+  const v = await read($, view)
+  if (!project?.pass) return { text: 'Run /land first: the PR body is filled from its evidence.' }
+  const p = project.pass
+  const ev = (v?.evidence ?? []).map(e => `- \`${e.cmd}\`: ${e.ok ? 'passed' : 'FAILED'} (${secs(e.ms)})`).join('\n') || '- (no checks found; say how you tested)'
+  const body = [
+    '## Summary',
+    '- (what changed and why)',
+    '',
+    '## Testing',
+    ev,
+    `- review-layers: ${p.status} at round ${project.rounds ? Object.values(project.rounds).reduce((m, r) => Math.max(m, r.count), 0) : 1}, ${p.tier} risk${p.approved ? ', approved' + (p.note ? ': ' + p.note : '') : ''}`,
+    '',
+    '## Risk',
+    `- Tier: ${p.tier}. ${p.tier === 'high' ? 'Touches a path that always needs a person.' : p.tier === 'medium' ? 'Ordinary product change.' : 'Additive or internal only.'}`,
+    '',
+    '## How to revert',
+    '- `git revert <merge commit>`; (name the flag to turn off, if any)',
+  ].join('\n')
+  return { text: body, context: ['Use this body for the pull request, filling in the Summary line and the revert note from what you know of the change.'] }
+}
+
+// ---------- the mod ----------
+
+export const register: Register = (on, options) => {
+  OPTS = options
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'land',
+      description: 'review-layers: run the review layers on the changes that would be pushed (status, fix, approve, resolve, learn, incident, eval, pr, help)',
+      argumentHint: '[quick|standard|deep] [focus] | status | fix | approve | resolve n why | learn note | ...',
+    })
+    await $.tool.register({
+      name: 'land',
+      description:
+        'Runs review-layers on the changes that would be pushed: the project checks, a risk tier, parallel bug hunters whose findings verifiers confirm, a security pass, and a round cap. Returns the report. Call it after fixing findings or before saying work is ready to push; a push is gated until it is green.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          depth: { type: 'string', enum: ['quick', 'standard', 'deep'], description: 'quick (one hunter, cheapest), standard (default), deep (session model, more votes, build runs)' },
+          focus: { type: 'string', description: 'What to pay special attention to, in a few words' },
+        },
+      },
+      isDeferred: false,
+    })
+    // the band draws from the store's last verdict for this project
+    try {
+      const cwd: string = await $.session.cwd()
+      const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+      if (top.exitCode === 0) {
+        const root = top.stdout.trim()
+        const project = (await loadProjects($))[root]
+        if (project?.pass) {
+          const snapLite: Snapshot = { root, head: project.pass.head, branch: '', baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false, isRepo: true }
+          await update($, view, () => viewOf(root, project, snapLite, [], project.findings ?? [], 0, Object.values(project.rounds).reduce((m, r) => Math.max(m, r.count), 0)))
+        }
+      }
+    } catch {
+      // no band until the first run
+    }
+    return next(e)
+  })
+
+  // three lines in the system prompt: the whole process, from the model's side
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    return {
+      sections: [
+        ...r.sections,
+        {
+          id: 'review-layers:rules',
+          scope: 'session',
+          text:
+            '# review-layers\nBefore saying a code change is done, run the project\'s checks and show their output. Before any git push or PR, run the review with the `' +
+            TOOL +
+            '` tool (the user types /land): fix every instance of each verified finding or tell the user why it is wrong, then re-run until it is green. A push is gated until then.',
+        },
+      ],
+    }
+  })
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const verdict = await gateVerdict($, options, e.command)
+    if (verdict.deny) return { deny: verdict.deny }
+    if (verdict.warn) $.ui.toast(`review-layers: ${verdict.warn}`)
+    const ran = await next(e)
+    if (ran.deny === undefined && ran.isError !== true) await countLanding($, e.command)
+    return ran
+  }).catch(($, e, next) => (next.called ? next(e) : String(options.gate ?? 'block') === 'block' && (PUSH.test(e.command) || PR.test(e.command)) ? { deny: 'review-layers: its gate could not check this push; run /land status.' } : next(e)))
+
+  on('tool.call', { tool: TOOL }, async ($, e: any) => {
+    const depth: Depth = e.depth === 'quick' || e.depth === 'deep' ? e.depth : (String(options.depth ?? 'standard') as Depth)
+    const r = await land($, { depth, focus: String(e.focus ?? ''), options })
+    return { result: r.text + (r.context.length ? '\n\n' + r.context.join('\n') : '') }
+  })
+
+  // after each turn, a cheap local check: did the changes move on since the last verdict?
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      try {
+        const v = await read($, view)
+        if (v && v.status !== 'running' && v.status !== 'idle') {
+          const cwd: string = await $.session.cwd()
+          const snap = await snapshot($, cwd)
+          if (snap.isRepo && snap.root === v.root) {
+            const project = (await loadProjects($))[snap.root]
+            const review = await readReviewMd($, snap.root)
+            const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
+            const hash = await sha(files.map(f => f.hash).join(','))
+            const same = project?.pass?.diffHash === hash
+            if (!same && v.status !== 'stale') await update($, view, x => (x ? { ...x, status: 'stale' as const, line: `land · changes since the last review (${files.length} file${files.length === 1 ? '' : 's'}) · run /land` } : x))
+            if (same && v.status === 'stale' && project?.pass) await update($, view, x => (x ? viewOf(snap.root, project, snap, x.layers, x.findings, x.tokens, x.round, x.evidence) : x))
+          }
+        }
+      } catch {
+        // a band that is a turn behind is fine
+      }
+    }
+    return next(e)
+  })
+
+  on('command.run', { command: 'land' }, async ($, e) => {
+    const raw = String(e.args ?? '').trim()
+    const first = (raw.split(/\s+/)[0] ?? '').toLowerCase()
+    const rest = raw.slice(first.length).trim()
+    const send = (text: string) => {
+      $.clock.after(50, () => {
+        void $.prompt.submit({ text, asUser: true })
+      })
+    }
+    switch (first) {
+      case 'help':
+        return { text: HELP }
+      case 'status':
+        return { text: await cmdStatus($) }
+      case 'approve':
+        return { text: await cmdApprove($, rest) }
+      case 'resolve':
+        return { text: await cmdResolve($, rest) }
+      case 'learn':
+        return { text: await cmdLearn($, rest) }
+      case 'init':
+        return { text: await cmdInit($) }
+      case 'incident':
+        return { text: await cmdIncident($, rest) }
+      case 'eval':
+        return { text: await cmdEval($, options) }
+      case 'pr':
+        return await cmdPr($)
+      case 'pane':
+        await $.ui.open({ id: PANE, title: 'Review layers' })
+        return { text: 'Review layers pane opened.' }
+      case 'reset': {
+        const cwd: string = await $.session.cwd()
+        const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+        if (top.exitCode !== 0) return { text: 'review-layers: not a git repository.' }
+        const root = top.stdout.trim()
+        const project = await loadProject($, root)
+        const branch = (await sh($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root })).stdout.trim()
+        delete project.rounds[branch]
+        delete project.pass
+        project.findings = []
+        await saveProject($, root, project)
+        await update($, view, () => null)
+        return { text: `Forgot the rounds and verdict for ${branch}. The next /land is round 1.` }
+      }
+      case 'fix': {
+        const cwd: string = await $.session.cwd()
+        const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+        const project = top.exitCode === 0 ? (await loadProjects($))[top.stdout.trim()] : undefined
+        const open = (project?.findings ?? []).filter(f => f.status !== 'resolved')
+        if (!open.length) return { text: 'No open findings to fix. Run /land first.' }
+        send(fixPrompt(open))
+        return { text: `Asking Claude to fix ${open.length} finding${open.length === 1 ? '' : 's'}.` }
+      }
+      default: {
+        const depth: Depth = first === 'quick' || first === 'deep' || first === 'standard' ? first : (String(options.depth ?? 'standard') as Depth)
+        const focus = first === 'quick' || first === 'deep' || first === 'standard' ? rest : raw
+        const r = await land($, { depth, focus, options })
+        // red with findings: the fix loop runs itself; a person reads the result when it is green or the cap is hit
+        const open = r.view.findings.filter(f => f.status !== 'resolved')
+        const overCap = r.view.layers.some(l => l.name === 'converge' && l.state === 'fail')
+        const checksFailed = r.view.evidence.some(ev => !ev.ok)
+        if (autoFix() && !overCap && (open.length || checksFailed)) {
+          send(
+            checksFailed && !open.length
+              ? `review-layers: a project check failed:\n\n${r.view.evidence.filter(ev => !ev.ok).map(ev => `$ ${ev.cmd}\n${ev.tail}`).join('\n\n')}\n\nFix the cause (not the check), run it again and show the passing output, then call the ${TOOL} tool to re-review. Do not push until it is green.`
+              : fixPrompt(open),
+          )
+          return { text: r.text + '\n\nHanding the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).' }
+        }
+        return r.context.length ? { text: r.text, context: r.context } : { text: r.text }
+      }
+    }
+  })
+
+  // the band above the prompt: the verdict in one line, with the next step as a button
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const v = await read($, view)
+    if (!v || e.props.hasSurvey) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const color = v.status === 'green' ? 'green' : v.status === 'red' ? 'red' : v.status === 'amber' || v.status === 'stale' ? 'yellow' : undefined
+    const line = v.status === 'running' ? `land ▸ ${v.step}` : v.line
+    const act = (text: string) => {
+      $.clock.after(50, () => {
+        void $.prompt.submit({ text, asUser: true })
+      })
+    }
+    return (
+      <Box gap={1}>
+        <Text color={color}>{line}</Text>
+        {v.tokens > 0 && <Text dimColor>{kTokens(v.tokens)} tok</Text>}
+        {v.status === 'red' && v.findings.some(f => f.status !== 'resolved') && (
+          <Button key="fix" label="Fix" hotkey="f" onPress={() => void $.command.run({ command: 'land', args: 'fix' })} />
+        )}
+        {(v.status === 'stale' || v.status === 'red') && <Button key="run" label="Run /land" hotkey="l" onPress={() => void $.command.run({ command: 'land', args: '' })} />}
+        {v.status === 'amber' && <Button key="approve" label="Approve" hotkey="a" onPress={() => act('/land approve')} />}
+        <Button key="pane" plain onPress={() => void $.ui.open({ id: PANE, title: 'Review layers' })}>
+          <Text dimColor>layers</Text>
+        </Button>
+      </Box>
+    )
+  })
+
+  // the pane: every layer, the evidence, the findings
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const v = await read($, view)
+    if (!v) {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>No review yet. Run /land on a branch with changes.</Text>
+        </Box>
+      )
+    }
+    const width = Math.max(40, e.props.bodyColumns ?? 80)
+    return (
+      <Box flexDirection="column">
+        <Text weight="bold">{v.status === 'running' ? `running: ${v.step}` : v.line}</Text>
+        <Text dimColor>
+          round {v.round} · {v.tier ?? '?'} risk · {kTokens(v.tokens)} tokens this run
+        </Text>
+        <Box flexDirection="column" marginTop={1}>
+          {v.layers.map(l => (
+            <Text key={'l-' + l.name} dimColor={l.state === 'skip' || l.state === 'wait'} color={l.state === 'fail' ? 'red' : l.state === 'pass' ? 'green' : undefined}>
+              {mark(l.state)} {l.name.padEnd(10)} {clip(l.note, width - 14)}
+            </Text>
+          ))}
+        </Box>
+        {v.evidence.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            {v.evidence.map(ev => (
+              <Text key={'e-' + ev.cmd} color={ev.ok ? undefined : 'red'}>
+                {ev.ok ? '✓' : '✗'} {clip(ev.cmd, width - 12)} {secs(ev.ms)}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {v.findings.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            {v.findings.map(f => (
+              <Box key={'f-' + f.fp} flexDirection="column" marginBottom={1}>
+                <Text color={f.status === 'resolved' ? undefined : f.severity === 'important' ? 'red' : 'yellow'} dimColor={f.status === 'resolved'}>
+                  {f.n ? f.n + '. ' : ''}[{f.severity}
+                  {f.lens === 'security' ? ', security' : ''}
+                  {f.status === 'repeat' ? ', still open' : f.status === 'resolved' ? ', resolved' : ''}] {f.file}
+                  {f.line ? ':' + f.line : ''}
+                </Text>
+                <Text wrap="wrap">
+                  {'   '}
+                  {f.title}
+                </Text>
+                <Text dimColor wrap="wrap">
+                  {'   fix: '}
+                  {f.fix}
+                </Text>
+              </Box>
+            ))}
+          </Box>
+        )}
+        {v.status === 'amber' && <Text color="yellow">A person reads the evidence and runs /land approve.</Text>}
+        {v.status === 'green' && <Text color="green">Cleared to push.</Text>}
+      </Box>
+    )
+  })
+}

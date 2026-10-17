@@ -1,0 +1,74 @@
+{
+  "name": "review-layers",
+  "version": "0.1.0",
+  "description": "Layered code review for agent-written changes, the way the Claude Code team lands code: checks run first, a risk tier is set from the change, parallel bug hunters post only findings that verifiers confirm, security findings block, review rounds are capped, repeated lessons go into REVIEW.md, incidents become an eval, and git push / gh pr are gated until /land is green. Token-light: haiku by default, the diff sent once and cached, later rounds re-read only what changed.",
+  "author": {
+    "name": "Sean Johnson"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Reviewer model",
+      "description": "Hunters and verifiers run on this. haiku is cheap and good enough for most diffs; inherit uses the session's model.",
+      "default": "haiku",
+      "options": [
+        "haiku",
+        "sonnet",
+        "opus",
+        "inherit"
+      ]
+    },
+    "depth": {
+      "type": "string",
+      "title": "Default depth",
+      "description": "quick: one hunter, no voting. standard: three hunters, two verifiers each. deep: three hunters on the session model, three verifiers, build runs too.",
+      "default": "standard",
+      "options": [
+        "quick",
+        "standard",
+        "deep"
+      ]
+    },
+    "gate": {
+      "type": "string",
+      "title": "Gate on git push and gh pr",
+      "description": "block refuses the command until /land is green (and approved where the tier needs it); warn only toasts; off does nothing. The gate only applies in a project where /land has run or a REVIEW.md exists.",
+      "default": "block",
+      "options": [
+        "block",
+        "warn",
+        "off"
+      ]
+    },
+    "roundCap": {
+      "type": "number",
+      "title": "Review rounds before stepping back",
+      "description": "After this many rounds on the same branch without going green, the hunters stop and you are asked to reconsider the approach.",
+      "default": 3
+    },
+    "maxDiffChars": {
+      "type": "number",
+      "title": "Diff budget (characters)",
+      "description": "The most diff text sent to the reviewers per run; bigger diffs are trimmed per file. 40000 is roughly 10k tokens.",
+      "default": 40000
+    },
+    "approvals": {
+      "type": "string",
+      "title": "Who must approve",
+      "description": "author-counts: whoever prompted the change is its reviewer, so medium risk is cleared by a green run and only high risk needs /land approve. strict: medium needs /land approve too.",
+      "default": "author-counts",
+      "options": [
+        "author-counts",
+        "strict"
+      ]
+    },
+    "autoFix": {
+      "type": "boolean",
+      "title": "Fix loop runs itself",
+      "description": "When a run is red, the findings go straight to Claude to fix and re-review, up to the round cap. Off: you run /land fix yourself.",
+      "default": true
+    }
+  }
+}
