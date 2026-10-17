@@ -71,23 +71,50 @@ Code owners tell the reviewer what matters in their repo. `/land init` writes th
 
 When something ships broken, record it: `/land incident <commit> "<what broke>"`. The set lives in `.review-layers/incidents.json` (commit it). `/land eval` re-runs the hunters over each incident's diff and reports how many it would have caught. Change the reviewer (a REVIEW.md line, the model, the depth), run the eval again, keep the change only when the score holds.
 
+## Requirements
+
+- **Claude Code 2.1.287 or later** (`claude --version`). review-layers is a [mod](https://code.claude.com/docs/en/plugins/mods/overview), which that version introduced.
+- **Where it runs:** the terminal, and the desktop app's Code tab (macOS and Linux). Hooks also run under `claude -p`, the VS Code panel and the Agent SDK, but the band and pane only draw in the terminal and desktop app. It does not load in WSL sessions or in cloud sessions (claude.ai/code).
+- **A git repo.** It reviews what `git push` would send; outside a repo `/land` does nothing.
+- **Model calls use your own Claude account**, on haiku by default. A typical standard run on a 200-line diff is 5–10k tokens. Nothing leaves your machine except those calls.
+- **Managed organisations:** if your company manages Claude Code, a plugin you install yourself may be blocked from loading (`allowManagedModsOnly`) or from changing the system prompt. The `/land` command and the gate still work where the plugin loads; only the three-line system-prompt section may be missing. Ask your admin to list it in managed settings if you want all of it.
+
 ## Install
 
-At the prompt of a terminal session:
+At the prompt of a Claude Code session (terminal or desktop app):
 
 ```
 /plugin install review-layers --marketplace seanjohnson-dev/review-layers
 ```
 
+Claude Code asks you to confirm adding the marketplace, then installs the plugin at user scope. The two-step form does the same thing:
+
+```
+/plugin marketplace add seanjohnson-dev/review-layers
+/plugin install review-layers@review-layers
+```
+
 From a shell:
 
 ```bash
-claude plugin install review-layers --marketplace seanjohnson-dev/review-layers
+claude plugin marketplace add seanjohnson-dev/review-layers
+claude plugin install review-layers@review-layers
 ```
 
-In the desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `seanjohnson-dev/review-layers`, then **Add plugin**.
+Restart Claude Code after installing. A user-scope install is shared by the terminal and the desktop app's Code tab, so one install covers both.
 
 Then, in a project: `/land init` (or just `/land`). The gate only switches on in a project where `/land` has run or a `REVIEW.md` exists, so other repos are untouched.
+
+## Update, disable, uninstall
+
+```bash
+claude plugin update review-layers@review-layers      # or "Update now" under /plugin → Installed
+claude plugin disable review-layers@review-layers     # keep it installed, switch it off
+claude plugin uninstall review-layers@review-layers
+claude plugin marketplace remove review-layers        # also removes the plugin
+```
+
+For one session without any mod: `claude --safe-mode`. Uninstalling leaves your `REVIEW.md` and `.review-layers/incidents.json` in place; delete them if you want them gone.
 
 ## Options
 
@@ -119,5 +146,7 @@ In `/config` (or `pluginConfigs["review-layers"].options` in `~/.claude/settings
 claude plugin validate .
 claude plugin test .
 ```
+
+Version 0.1.0. Issues and pull requests are welcome; it is one person's project, so expect answers in days, not hours.
 
 MIT.
