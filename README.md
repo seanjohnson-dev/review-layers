@@ -1,5 +1,9 @@
 # review-layers
 
+![review-layers: a red run, the fix loop, approval, and the gate clearing a push](media/review-layers.gif)
+
+*[Watch the 69-second video](media/review-layers.mp4): the blog's process, and `/land` running it on a real change.*
+
 A Claude Code mod that lands code the way the Claude Code team does: **layers, not one gate**. It recreates the process from [How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic/) for one person and their agent, with two rules the blog sets as goals: **as little human time as the reverts allow**, and **as few tokens as the review allows**.
 
 ```
