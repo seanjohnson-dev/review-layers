@@ -1,0 +1,12 @@
+{
+  "name": "review-layers",
+  "owner": { "name": "Sean Johnson" },
+  "description": "review-layers: layered, token-light code review for agent-written changes in Claude Code",
+  "plugins": [
+    {
+      "name": "review-layers",
+      "source": "./",
+      "description": "Layered, token-light code review for agent-written changes: checks, risk tier, hunters + verifier voting, security, round cap, REVIEW.md learning, incidents-as-eval, and a gate on push and PR"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "description": "review-layers hooks module",
+  "modules": ["./register.tsx"]
+}
