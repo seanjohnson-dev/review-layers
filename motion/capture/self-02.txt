@@ -1,0 +1,19 @@
+review-layers · RED: 0 open findings, checks failing · main (working tree changes) · 3 files · 0 tokens · 1s
+  ✗ verify     claude plugin test . failed
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  – hunters    checks failed first; fix those, then run again
+  – verifiers  
+  – security   
+  ✓ converge   round 2 of 3
+  ✗ gate       push blocked until green
+
+$ claude plugin validate .  (ok, 1s)
+  ⚠ Found 1 warning:
+    ❯ metadata.description: No marketplace description provided. Adding a description helps users understand what this marketplace offers
+  ✔ Validation passed with warnings
+
+$ claude plugin test .  (FAILED, 0s)
+  error: unknown command 'test'
+  (Did you mean list?)
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

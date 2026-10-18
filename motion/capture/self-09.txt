@@ -1,0 +1,33 @@
+review-layers · RED: 2 open findings · main (working tree changes) · 5 files · 60k tokens · 35s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    6 raised (3 distinct), 2 confirmed, 1 dropped
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 2 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.57s]
+
+1. [IMPORTANT, security] hooks/register.tsx:345: Check commands are POSIX sh but now run under the user's login shell, which may be fish (2/3 votes)
+   class: shell-dialect mismatch in check commands
+   why: runChecks now runs `[shell, '-lc', cmd]` where shell is taken from $SHELL (fish is accepted by the regex). The new plugin command is POSIX syntax: `c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .`. Fish rejects `${VAR:-...}`, `[ -x ]` and `c=...` assignment, so the check fails for fish users and the gate goes red although the code is fine.
+   fix: Run checks with a fixed POSIX shell (`sh -lc`) or only use the user's shell when it is zsh/bash, and keep the command syntax POSIX-compatible.
+   also: hooks/register.tsx:380, hooks/register.tsx:343 (Plugin check uses POSIX-only syntax but runs under the …, hooks/register.tsx:343
+2. [IMPORTANT] hooks/register.tsx:383: Plugin check uses POSIX parameter expansion but runs under the user's SHELL, which may be fish (2/2 votes)
+   class: shell-specific syntax run under a non-POSIX login shell
+   why: runChecks now runs each command as `[shell, '-lc', cmd]` with shell taken from $SHELL, and the new plugin command is `c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c"`. For a fish user this syntax fails, so the check exits non-zero and the gate goes red for a valid plugin.
+   fix: Always run these commands with `sh -lc` or make the command shell-neutral; keep the user shell only for PATH discovery.
+   also: hooks/register.tsx:343
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

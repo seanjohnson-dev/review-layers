@@ -1,0 +1,45 @@
+review-layers · RED: 5 open findings · main (working tree changes) · 5 files · 67k tokens · 33s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    9 raised (6 distinct), 5 confirmed, 1 dropped
+  ✓ verifiers  voted
+  ✗ security   4 open
+  ▸ converge   round 3 of 3
+  ✗ gate       push blocked until green
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.54s]
+
+1. [IMPORTANT, security lens] hooks/register.tsx:479: Source-first ranking never affects which files are cut (3/3 votes)
+   class: dead priority ranking in budget trimming
+   why: `ranked` sorts SOURCE files first, but the water-filling loop uses `sizes` sorted globally by length, and `level` is one cap applied to every file. The `ranked` order only sets iteration order into `byFile`, so an asset and a source file of equal length get the same cut. The comment 'source files come first and keep the most' is not what the code does.
+   fix: Compute the level separately per priority tier (source files first, then the rest) so source files get the larger budget, or drop the ranking and the comment.
+   also: hooks/register.tsx:467, hooks/register.tsx:469-482
+2. [IMPORTANT] hooks/register.tsx:478: Source-first ranking in budgetDiff never affects which files get cut (2/2 votes)
+   class: sort priority ignored by allocation
+   why: The comment says 'source files come first and keep the most', but `ranked` only orders the output. The water-filling loop uses `sizes = ranked.map(...).sort(...)`, a single global level, so a source file and an asset of the same size are cut to the same `level`. The SOURCE regex has no effect on the trimming.
+   fix: Allocate per priority tier: fill the source files' budget first, then give the remaining budget to non-source files, or give source files a higher level.
+3. [IMPORTANT, security lens] hooks/register.tsx:498: Final truncation drops the tail of the diff regardless of priority (2/3 votes)
+   class: budget truncation by position, not priority
+   why: `text = files.map(f => byFile.get(f)).join('\n')` keeps original file order, then `text.slice(0, max)` cuts the end of that string. The last files in the original order are lost even when they are the most important source files that the ranking was meant to protect.
+   fix: Apply the cap per file in priority order so the lowest-priority files are dropped first, instead of slicing the joined text.
+   also: hooks/register.tsx:496-501, hooks/register.tsx:497
+4. [nit, security lens] hooks/register.tsx:570: hunkFor maps a file line number to a diff row index (2/3 votes)
+   class: line number used as diff row offset
+   why: `const at = Math.max(0, line - start + 1)` subtracts the new-file start line from the file line number, but `rows` is a list of diff rows, which include removed lines and context. The window is centred on the wrong row whenever the hunk has removed lines or the line is far from the start.
+   fix: Walk the hunk's rows, counting only '+' and ' ' rows, to find the row for the target line.
+5. [nit, security lens] hooks/register.tsx:922: Instance filter drops other lines in the same file (2/2 votes)
+   class: prefix match on location string
+   why: `others = ...filter(i => !i.startsWith(where))` with where='file:12' also removes 'file:120' and 'file:125', so related instances are hidden from the 'also:' list.
+   fix: Compare exact instance strings, or compare the parsed file and line separately.
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

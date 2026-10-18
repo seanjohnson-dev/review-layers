@@ -1,0 +1,38 @@
+review-layers · RED: 3 open findings · main (3 commits ahead of origin/main + working tree changes) · 7 files · 113k tokens (19k cache reads) · 48s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/lib.ts is a path that always needs a person
+  ✗ hunters    4 raised (4 distinct), 3 confirmed, 1 dropped, diff trimmed by 3.9k chars
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   22 pass
+   0 fail
+  Ran 22 tests across 3 files. [0.56s]
+
+1. [IMPORTANT] hooks/lib.ts:55: diffBody returns '' for binary and mode-only diffs, so their fileHashes never change (2/2 votes)
+   class: hash ignores content of header-only diffs
+   why: diffBody returns '' when there is no '@@ ' hunk, and splitDiff now does `hash: await sha(diffBody(text))`. A binary change ('Binary files a/x and b/x differ') or a pure mode/rename has no hunk, so every such file hashes to sha('') and a content change leaves the hash identical. landOnce records `round.fileHashes[f.file] = f.hash`, so the recorded state cannot detect the change.
+   fix: Fall back to hashing the whole per-file text when there is no hunk, e.g. `at < 0 ? text : text.slice(at)`, so header-only diffs still carry their content.
+   also: hooks/register.tsx:261
+2. [IMPORTANT, security] hooks/lib.ts:45: diffBody drops every header line, so mode-only, binary and rename-only changes hash the same (2/2 votes)
+   class: hash ignores changes that have no hunk
+   why: diffBody returns '' when there is no '@@ ' line (`return at < 0 ? '' : text.slice(at)`). Binary changes, chmod changes and pure renames have no hunk, so their body is '' and their hash never changes. splitDiff now uses `hash: await sha(diffBody(text))`, and fileHashes records that hash for review rounds.
+   fix: Hash the full diff text, or at least keep the header lines that carry mode, rename and binary information. Only drop the index line.
+   also: hooks/register.tsx: splitDiff `hash: await sha(diffBody(text))`
+3. [IMPORTANT] hooks/lib.ts:124: diffBody returns '' for diffs without @@ hunks, so binary, mode-only and rename-only changes hash the same (1/2 votes)
+   class: content hash ignores changes that have no hunk
+   why: diffBody does `return at < 0 ? '' : text.slice(at)`. Binary files ('Binary files differ'), mode-only changes and pure renames have no `@@ ` line, so every such change hashes to sha('') regardless of content. splitDiff stores that as `hash`, and landOnce writes it to `round.fileHashes` when hunters answer, so a later edit to the binary or asset can look already reviewed.
+   fix: When there is no hunk, hash the full diff text (or the blob ids from the `index` line) instead of returning ''.
+   also: hooks/register.tsx:262
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

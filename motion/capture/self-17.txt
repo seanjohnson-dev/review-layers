@@ -1,0 +1,37 @@
+review-layers · RED: 1 open finding · main (4 commits ahead of origin/main + working tree changes) · 7 files · 66k tokens (8.2k cache reads) · 52s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/lib.ts is a path that always needs a person
+  ✗ hunters    3 raised (3 distinct), 3 confirmed, 0 dropped
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 2 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   22 pass
+   0 fail
+  Ran 22 tests across 3 files. [0.56s]
+
+1. [IMPORTANT, security] hooks/lib.ts:94: diffBody drops file path, rename and mode changes whenever a hunk exists, so the review hash can match different changes (2/2 votes)
+   class: verification key discards security-relevant metadata
+   why: diffBody returns text.slice(at) from the first '@@ ' line, so the 'diff --git a/... b/...' line, 'old mode'/'new mode', 'rename from'/'rename to' and 'similarity' lines are all discarded for any file with a hunk. The test only exercises 'index' and 'new file mode' headers, so a content-identical change to a different path, or a 100644→100755 mode flip alongside a hunk, hashes the same as the revi…
+   fix: Hash the header fields that carry path and mode (diff --git line, mode and rename lines) together with the body, and drop only the 'index' line.
+   also: hooks/lib.ts:94-99
+2. [nit] hooks/lib.ts:122: severity rank reads inherited Object properties (2/2 votes)
+   class: prototype key lookup on untrusted input
+   why: `const SEV = {...} as Record<string, number>` and `rank = SEV[String(sev)] ?? 0`. A model-supplied severity such as "constructor" or "toString" returns an inherited function, not undefined, so `?? 0` does not apply and `stronger` compares a function with a number. The bogus string then survives as the merged severity.
+   fix: Use `Object.hasOwn(SEV, k) ? SEV[k] : 0` or a Map, and reject severities outside the three known values.
+   also: hooks/lib.ts:123
+3. [nit] hooks/lib.ts:105: hunkFor miscounts new-file lines after a '\ No newline' marker (1/2 votes)
+   class: off-by-one in line mapping
+   why: The row loop skips only '-' rows and increments n for every other row, including the '\ No newline at end of file' marker that git emits after a line. A marker between a '-' and '+' row shifts every later new-file line number in that hunk by one, so the wrong context window is returned.
+   fix: Skip rows whose first character is '\' as well as '-' before incrementing n.
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

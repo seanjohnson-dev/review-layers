@@ -1,0 +1,28 @@
+review-layers · RED: 1 open finding · main (2 commits ahead of origin/main + working tree changes) · 7 files · 104k tokens (19k cache reads) · 57s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/lib.ts is a path that always needs a person
+  ✗ hunters    4 raised (2 distinct), 1 confirmed, 1 dropped, diff trimmed by 3.9k chars
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   22 pass
+   0 fail
+  Ran 22 tests across 3 files. [0.57s]
+
+1. [IMPORTANT, security] hooks/lib.ts:83: diffBody strips content lines that begin with --- or +++, so edits to them do not change the file hash (4/4 votes)
+   class: hash ignores real content changes
+   why: The filter drops any line matching /^--- /or /^\+\+\+ /. A removed line whose content starts with '-- ' (SQL, Lua, Haskell comments) appears as '--- ...' in a diff, and an added line starting with '++ ' appears as '+++ ...'. Those lines are removed before hashing, so changing them leaves the hash equal. fileHashes is then treated as proof the file was reviewed, so a changed file can be skipped on…
+   fix: Strip only the file header lines, i.e. the '--- ' and '+++ ' lines that directly follow a 'diff --git' header, rather than every line matching those prefixes.
+   also: hooks/lib.ts:84, hooks/lib.ts:146, hooks/register.tsx:261, hooks/lib.ts:122 (diffBody strips removed/added lines whose content starts wi…), hooks/lib.ts:122, hooks/register.tsx:262
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

@@ -1,0 +1,18 @@
+review-layers · INCOMPLETE: a hunter did not answer, run /land again · main (working tree changes) · 5 files · 81k tokens (26k cache reads) · 35s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    not every hunter answered (edges: empty-reply; security: empty-reply): run /land again
+  ✓ verifiers  nothing to vote on
+  ✓ security   clean
+  ✓ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.59s]

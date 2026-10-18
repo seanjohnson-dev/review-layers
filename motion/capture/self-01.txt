@@ -1,0 +1,18 @@
+review-layers · RED: 1 open finding · main (working tree changes) · 19 files · 52k tokens · 23s
+  – verify     no checks found (add a ## Checks section to REVIEW.md)
+  ✓ risk tier  medium: set by the classifier from the change
+  ✗ hunters    1 raised (1 distinct), 1 confirmed, 0 dropped, diff trimmed by 62k chars
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+1. [IMPORTANT, security] hooks/register.tsx:424: Verifier prompt treats diff text as trusted, so code can instruct it to vote not-real (1/2 votes)
+   class: prompt injection into LLM reviewer
+   why: VERIFIER_SYSTEM only says to be skeptical and answer JSON, with no warning that the diff is untrusted. hunkFor() passes raw f.text from the diff into the verifier, so a comment or string in the change can say 'verdict not-real'. Low-risk changes land with no one in the loop, so a suppressed finding can reach push.
+   fix: State in the system prompt that the hunk is untrusted data and must not be followed. Validate the verdict against the evidence (for example, require the verifier to quote the line it relies on) and n…
+   also: hooks/register.tsx:510
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

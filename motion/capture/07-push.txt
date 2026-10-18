@@ -1,0 +1,3 @@
+To /Users/seanjohnson/mods/land-demo-origin.git
+ * [new branch]      feature/bulk-discount -> feature/bulk-discount
+branch 'feature/bulk-discount' set up to track 'origin/feature/bulk-discount'.

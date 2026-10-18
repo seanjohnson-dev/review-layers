@@ -1,0 +1,33 @@
+review-layers · RED: 2 open findings · main (working tree changes) · 7 files · 104k tokens (37k cache reads) · 1m 22s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    3 raised (2 distinct), 2 confirmed, 0 dropped, diff trimmed by 327 chars
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   19 pass
+   0 fail
+  Ran 19 tests across 3 files. [0.58s]
+
+1. [IMPORTANT] hooks/lib.ts:103: Same-fingerprint merge can replace a stronger finding with a weaker one (3/3 votes)
+   class: severity not kept at the strongest level when findings merge
+   why: `if (!had.f.why && f.why) had.f = { ...f, lens: had.f.lens, instances: had.f.instances }` swaps in the incoming finding's severity wholesale. The next line compares against the already-replaced `had.f.severity`, so a stronger earlier `important` is lost if the later `nit` has a why and the earlier one did not. The comment promises 'Severity is the strongest any of them gave it'.
+   fix: Compute the max severity before any replacement, and carry it into the replacement object.
+   also: hooks/lib.ts: mergeRaw first loop (`had.f = { ...f, ... }`), hooks/lib.ts:125, hooks/lib.ts: mergeRaw near-merge block (`if (near)`)
+2. [IMPORTANT, security lens] hooks/lib.ts:118: mergeRaw replaces the kept finding with the absorbed one without taking the strongest severity (2/2 votes)
+   class: severity downgraded when merging duplicate findings
+   why: In the same-file merge, `if (String(x.f.why ?? '').length > ...) near.f = { ...x.f, ... }` overwrites severity with the absorbed finding's value. A longer-worded 'nit' can replace an 'important' finding, so the gate sees it as non-blocking. The byFp path has the same gap: `if (!had.f.why && f.why) had.f = { ...f, ... }` drops the earlier severity before the SEV comparison runs.
+   fix: Compute the max of SEV[severity] across the two findings and set it on whichever object is kept, in both merge paths, before any replacement.
+   also: hooks/lib.ts:103
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

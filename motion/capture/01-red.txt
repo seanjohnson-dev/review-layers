@@ -1,0 +1,40 @@
+review-layers · RED: 3 open findings · feature/bulk-discount (1 commit ahead of main) · 2 files · 27k tokens · 17s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: src/checkout.js is a path that always needs a person
+  ✗ hunters    10 raised (6 distinct), 4 confirmed, 2 dropped
+  ✓ verifiers  voted
+  ✓ security   clean
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ npm run lint  (ok, 0s)
+  > tillpoint@0.4.2 lint
+  > node --check src/cart.js && node --check src/checkout.js
+
+$ npm test  (ok, 0s)
+  ℹ skipped 0
+  ℹ todo 0
+  ℹ duration_ms 36.723584
+
+1. [IMPORTANT] src/cart.js:15: bulkDiscount subtracts rands from a cents total (4/4 votes)
+   class: rand/cents unit mismatch
+   why: The comment says "R5 off every unit" but the code sets `const perUnit = 5;` and returns `units * perUnit`. cartTotal and applyPromo work in integer cents, so this removes 5 cents per unit instead of R5 (500 cents), and the customer is overcharged.
+   fix: Use `const perUnitCents = 500;` and return `units * perUnitCents`, keeping every value in cents.
+   also: src/cart.js:11, src/cart.js:20
+2. [IMPORTANT] src/cart.js:18: averageLine returns a fractional value that checkout reports as averageLineCents (2/3 votes)
+   class: non-integer cents from division
+   why: `return cartTotal(cart) / cart.lines.length;` is not rounded, so a total of 1000 cents over 3 lines gives 333.33. checkout.js now returns this as `averageLineCents: averageLine(cart)` in the receipt, which is a money field and the file says the gateway takes cents.
+   fix: Round the result (Math.round or Math.floor) and document the rounding rule, or drop the field from the receipt.
+   also: src/checkout.js:10, src/cart.js:20
+3. [IMPORTANT] src/cart.js:14: bulkDiscount is not capped, so base can go negative and the percent promo path does not clamp it (2/2 votes)
+   class: discount exceeds total, negative amount passed on
+   why: `const base = cartTotal(cart) - bulkDiscount(cart);` has no floor. The fixed branch wraps the result in `Math.max(0, ...)`, but the percent branch returns `Math.round(base * ...)` directly, so a small cart with many units yields a negative amount that checkout can send to gateway.charge.
+   fix: Clamp base with `Math.max(0, ...)` before the promo branches, or clamp the final result in every branch.
+   also: src/cart.js:16
+4. [nit] src/cart.js:24: bulk discount subtracted without clamping before the no-promo return (3/3 votes)
+   class: unclamped discount can produce a negative total
+   why: `const base = cartTotal(cart) - bulkDiscount(cart);` is returned directly when `!promo`, and `percent` multiplies it without a floor. If the discount exceeds the cart total, the charge amount goes negative. Only the `fixed` path clamps with Math.max(0, ...).
+   fix: Clamp `base` with `Math.max(0, ...)` right after computing it.
+   also: src/cart.js:26
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).

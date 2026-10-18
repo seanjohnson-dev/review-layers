@@ -1,0 +1,42 @@
+review-layers · RED: 0 open findings, checks failing · main (5 commits ahead of origin/main + working tree changes) · 7 files · 0 tokens · 2s
+  ✗ verify     c="${CLAUDE:-$HOME/.local/bin… failed
+  ✓ risk tier  high: hooks/lib.ts is a path that always needs a person
+  – hunters    checks failed first; fix those, then run again
+  – verifiers  
+  – security   
+  ✓ converge   round 3 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (FAILED, 1s)
+  (pass) a path that always needs a person is high risk and needs a note to approve [27.29ms]
+  (pass) a failed check is red before any hunter runs, and no tokens are spent on hunting [31.24ms]
+  (pass) /land resolve closes a finding with a reason and it is not posted again [28.84ms]
+  (pass) the round cap stops the hunters and asks for a step back [35.31ms]
+  (pass) a project that never opted in is left alone by the gate [19.80ms]
+  (pass) /land learn writes the lesson into REVIEW.md, which the hunters then read [23.47ms]
+  (pass) the land tool runs the same layers for the model [25.74ms]
+  (pass) the system prompt gains one short review-layers section [18.14ms]
+  tests/lib.test.ts:
+  (pass) budgetDiff serves source files first and trims assets before code [11.10ms]
+  (pass) budgetDiff trims when every file fits alone but not together [0.33ms]
+  (pass) mergeRaw keeps the strongest severity and the absorbed finding as an instance [0.48ms]
+  (pass) mergeRaw does not merge different bugs that only share a few words [0.14ms]
+  (pass) hunkFor finds the hunk by the new-file line, counting removed rows out [0.26ms]
+  (pass) mergeRaw never lets a later, wordier nit downgrade an earlier important finding [0.17ms]
+  (pass) the near-site merge keeps the stronger severity whichever wording survives [0.28ms]
+  (fail) diffBody ignores how git labelled the change, so a commit does not change the hash [0.84ms]
+    AssertionError: expect(received).not.toBe()
+    Expected: not "diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n"
+    Received: "diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n"
+  tests/ui.test.ts:
+  (pass) the pane and the band draw on every surface before any run [64.51ms]
+   21 pass
+   1 fail
+  Ran 22 tests across 3 files. [0.57s]
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

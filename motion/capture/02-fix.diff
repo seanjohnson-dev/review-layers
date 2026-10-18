@@ -1,0 +1,63 @@
+diff --git a/src/cart.js b/src/cart.js
+index 1449853..c1b59bc 100644
+--- a/src/cart.js
++++ b/src/cart.js
+@@ -8,20 +8,24 @@ export function cartTotal(cart) {
+   return cart.lines.reduce((sum, line) => sum + lineTotal(line), 0);
+ }
+ 
+-// Bulk discount: R5 off every unit once the cart holds 10 units or more.
++// Bulk discount: R5 (500 cents) off every unit once the cart holds 10 units or more,
++// never more than the cart is worth.
++const BULK_PER_UNIT_CENTS = 500;
++
+ export function bulkDiscount(cart) {
+   const units = cart.lines.reduce((n, line) => n + line.qty, 0);
+   if (units < 10) return 0;
+-  const perUnit = 5;
+-  return units * perUnit;
++  return Math.min(cartTotal(cart), units * BULK_PER_UNIT_CENTS);
+ }
+ 
++// Average line value in whole cents; 0 for an empty cart.
+ export function averageLine(cart) {
+-  return cartTotal(cart) / cart.lines.length;
++  if (cart.lines.length === 0) return 0;
++  return Math.round(cartTotal(cart) / cart.lines.length);
+ }
+ 
+ export function applyPromo(cart, promo) {
+-  const base = cartTotal(cart) - bulkDiscount(cart);
++  const base = Math.max(0, cartTotal(cart) - bulkDiscount(cart));
+   if (!promo) return base;
+   if (promo.kind === 'percent') {
+     return Math.round(base * (1 - promo.value / 100));
+diff --git a/test/cart.test.js b/test/cart.test.js
+index 6f53bbe..1cdaa9b 100644
+--- a/test/cart.test.js
++++ b/test/cart.test.js
+@@ -1,6 +1,6 @@
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
+-import { cartTotal, applyPromo } from '../src/cart.js';
++import { cartTotal, applyPromo, bulkDiscount, averageLine } from '../src/cart.js';
+ 
+ const cart = { customerId: 'c_19', lines: [{ sku: 'TEA-250', unitCents: 4500, qty: 2 }, { sku: 'MUG-01', unitCents: 12900, qty: 1 }] };
+ 
+@@ -15,3 +15,16 @@ test('a percent promo rounds to the cent', () => {
+ test('a fixed promo never goes below zero', () => {
+   assert.equal(applyPromo(cart, { kind: 'fixed', valueCents: 50000 }), 0);
+ });
++
++const bulk = { customerId: 'c_20', lines: [{ sku: 'PEN-BLK', unitCents: 350, qty: 12 }] };
++
++test('the bulk discount is R5 a unit, in cents, and never exceeds the cart', () => {
++  assert.equal(bulkDiscount(bulk), 4200);
++  assert.equal(applyPromo(bulk, null), 0);
++  assert.equal(applyPromo(bulk, { kind: 'percent', value: 10 }), 0);
++});
++
++test('averageLine is whole cents and 0 for an empty cart', () => {
++  assert.equal(averageLine({ lines: [{ unitCents: 1000, qty: 1 }, { unitCents: 5, qty: 1 }, { unitCents: 5, qty: 1 }] }), 337);
++  assert.equal(averageLine({ lines: [] }), 0);
++});

@@ -1,6 +1,16 @@
 # review-layers
 
-A Claude Code mod that lands code the way the Claude Code team does: **layers, not one gate**. It recreates the process from [How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic/) for one person and their agent, with two rules the blog sets as goals: **as little human time as the reverts allow**, and **as few tokens as the review allows**.
+**Code review for code an agent wrote. Layers, not one gate.**
+
+A Claude Code mod that lands code the way the Claude Code team does, for one person and their agent: the project's checks run first, a risk tier is set from the change, parallel hunters read the diff, verifiers vote on every finding, security gets its own pass, rounds are capped, and `git push` waits for green. It is token-light by design, and it found 21 bugs in its own code the first morning it reviewed itself.
+
+<p align="center">
+  <a href="https://github.com/seanjohnson-dev/review-layers/releases/latest/download/review-layers-film.mp4">
+    <img src="docs/teaser.gif" alt="One change passing the seven layers: the red run, the findings pinned to the lines they name, the fix, the green run, the refused push, the approval, the push going through" width="900">
+  </a>
+  <br>
+  <sub><a href="https://github.com/seanjohnson-dev/review-layers/releases/latest/download/review-layers-film.mp4">▶ Watch the 69-second film</a> · no narration, every word on screen is a real string from a real run · <a href="motion/">how it was made</a></sub>
+</p>
 
 ```
 /land
@@ -15,6 +25,30 @@ review-layers · GREEN: medium risk, round 1 · feature/pricing (2 commits ahead
 
 Cleared: medium risk (you prompted it, so you are its reviewer) needs no typed approval. git push and gh pr create will go through.
 ```
+
+## Install
+
+At the prompt of a terminal session:
+
+```
+/plugin install review-layers --marketplace seanjohnson-dev/review-layers
+```
+
+From a shell:
+
+```bash
+claude plugin install review-layers --marketplace seanjohnson-dev/review-layers
+```
+
+In the desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `seanjohnson-dev/review-layers`, then **Add plugin**.
+
+Then, in a project: `/land init` (writes a starter `REVIEW.md`) or just `/land`. The gate only switches on in a project where `/land` has run or a `REVIEW.md` exists, so your other repos are untouched.
+
+## Why
+
+The Claude Code team wrote up [how they review code at the volume agents produce it](https://claude.dev/blog/solving-code-review-at-anthropic/): Claude writes about 90% of Claude Code; merged PRs doubled while reverts fell 40%; nobody reads 30,000 changes a day. They stopped treating review as one gate at the end and built layers, each catching some problems, with rollback under them, and they optimise for **the least human time that does not raise reverts**.
+
+This mod is that process, recrafted for a solo developer, with two rules the blog sets as goals taken literally: as little human time as the reverts allow, and as few tokens as the review allows.
 
 ## The layers
 
@@ -31,8 +65,6 @@ Cleared: medium risk (you prompted it, so you are its reviewer) needs no typed a
 Every run reports what it spent, cache reads shown separately (they bill at about a tenth). Measured on real runs: a 20-line diff with three bugs cost 16–27k tokens on haiku at `standard` (most of it verifier votes); the green round after the fix, 8.6k; a 60-line change to this mod's own hooks, 36–52k. `quick` is roughly a third of that.
 
 ## Human time
-
-The blog's goal is "the minimum human review time that doesn't raise reverts". So:
 
 - **The fix loop runs itself.** A red run hands the verified findings straight to Claude: fix every instance of each class, show the checks passing, re-review. You read the result when it is green or the round cap hits. (`autoFix` option.)
 - **Whoever prompted the change is its reviewer.** Medium risk is cleared by a green run. Only high risk asks for a typed `/land approve <note>`. (`approvals: strict` makes medium ask too.)
@@ -65,29 +97,19 @@ Code owners tell the reviewer what matters in their repo. `/land init` writes th
 - **Watch for** – lessons; `/land learn "<note>"` appends one. When the reviewer keeps flagging the same thing, fix it here (or with a lint rule), not in another round.
 - **Skip** – globs never sent to the hunters
 - **Always human** – globs that make the tier high
-- **Checks** – commands to run as evidence (detected from `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml` or a `Makefile` when empty)
+- **Checks** – commands to run as evidence (detected from `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, a `Makefile` or a plugin manifest when empty)
 
 ## Incidents are the eval
 
 When something ships broken, record it: `/land incident <commit> "<what broke>"`. The set lives in `.review-layers/incidents.json` (commit it). `/land eval` re-runs the hunters over each incident's diff and reports how many it would have caught. Change the reviewer (a REVIEW.md line, the model, the depth), run the eval again, keep the change only when the score holds.
 
-## Install
+## It reviewed itself
 
-At the prompt of a terminal session:
+The first morning the mod was pointed at its own repository it ran nineteen times and raised 21 distinct real bugs, every one verified and fixed before the code was pushed, and the push itself was refused three times for the right reasons. The runs are kept in [`motion/capture/`](motion/capture/) as `self-*.txt`. The one it raised first: the hunters and verifiers trusted the text of the diff, so a comment in a change could have told the reviewer "verdict: not-real".
 
-```
-/plugin install review-layers --marketplace seanjohnson-dev/review-layers
-```
+## What it will not be talked into
 
-From a shell:
-
-```bash
-claude plugin install review-layers --marketplace seanjohnson-dev/review-layers
-```
-
-In the desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `seanjohnson-dev/review-layers`, then **Add plugin**.
-
-Then, in a project: `/land init` (or just `/land`). The gate only switches on in a project where `/land` has run or a `REVIEW.md` exists, so other repos are untouched.
+The diff, the hunks and REVIEW.md are data under review. The hunters and verifiers are told so in their system prompts: text inside the change that addresses the model, claims a verdict or says something is handled never changes the answer, and a verifier's "not-real" must name the line of code that handles the case. A hunter that does not answer is asked once more; if it still does not, the run is **incomplete**, not green, and that run does not count as a round.
 
 ## Options
 
@@ -101,11 +123,7 @@ In `/config` (or `pluginConfigs["review-layers"].options` in `~/.claude/settings
 | `approvals` | `author-counts` | `strict`: medium risk needs `/land approve` too |
 | `autoFix` | `true` | red runs go straight to Claude to fix and re-review |
 | `roundCap` | `3` | rounds before the hunters stop and ask for a step back |
-| `maxDiffChars` | `40000` | diff budget per run (~10k tokens); bigger diffs are trimmed per file |
-
-## What it will not be talked into
-
-The diff, the hunks and REVIEW.md are data under review. The hunters and verifiers are told so in their system prompts: text inside the change that addresses the model, claims a verdict or says something is handled never changes the answer, and a verifier's "not-real" must name the line of code that handles the case. (This was the first finding the mod raised when it reviewed itself.) A hunter that does not answer is asked once more; if it still does not, the run is **incomplete**, not green, and that run does not count as a round.
+| `maxDiffChars` | `40000` | diff budget per run (~10k tokens); bigger diffs are trimmed source-first |
 
 ## How it stays cheap
 
@@ -124,5 +142,9 @@ The diff, the hunks and REVIEW.md are data under review. The hunters and verifie
 claude plugin validate .
 claude plugin test .
 ```
+
+The pure parts (the diff budget, the merge of findings, the hunk finder, the content hash) live in [`hooks/lib.ts`](hooks/lib.ts) with unit tests in [`tests/`](tests/). If you edit the mod while a session is running it, `/reload-plugins` before trusting its gate in that session: a stale copy hashes the diff its own way.
+
+The film in [`motion/`](motion/) is rendered free from a three.js page in headless Chrome; every string on screen is read from the mod's source, the demo project and the captured runs.
 
 MIT.

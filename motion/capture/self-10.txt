@@ -1,0 +1,31 @@
+review-layers · RED: 1 open finding · main (working tree changes) · 5 files · 76k tokens · 31s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    6 raised (6 distinct), 2 confirmed, 4 dropped
+  ✓ verifiers  voted
+  ✓ security   clean
+  ▸ converge   round 3 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.56s]
+
+1. [IMPORTANT] hooks/register.tsx:803: Merging near-duplicate findings can downgrade an important finding to nit, letting the gate pass (2/2 votes)
+   class: merge drops severity of absorbed finding
+   why: When a later finding is absorbed, the code does `near.f = { ...x.f, ... }` if `String(x.f.why).length > String(near.f.why).length`, so the surviving finding takes the absorbed finding's severity. Severity is decided by which hunter wrote the longer 'why', not by the bug. An important finding absorbed into a nit with a longer why becomes a nit, and the gate counts `open` as only important or secur…
+   fix: Keep the max severity across the merged group (important > nit > pre-existing) and keep the longer why separately; do not take severity from whichever object wins the length comparison.
+2. [nit] hooks/register.tsx:506: Files already truncated in place are counted again when dropped whole (2/2 votes)
+   class: double-counted trimmed characters
+   why: place() adds `f.text.length - level` to `cut` for a truncated file, then the drop loop does `cut += f.text.length` for the same file. The reported 'diff trimmed by N chars' figure overstates the trim.
+   fix: In the drop loop, add only the kept length (`t.length`, or `f.text.length - level` already counted) rather than `f.text.length`.
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

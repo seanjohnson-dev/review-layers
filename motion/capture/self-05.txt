@@ -1,0 +1,38 @@
+review-layers · RED: 3 open findings · main (working tree changes) · 5 files · 88k tokens · 38s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    10 raised (9 distinct), 3 confirmed, 6 dropped
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.53s]
+
+1. [IMPORTANT] hooks/register.tsx:836: file hashes are saved after a hunter failure, so the failed files are skipped next run (2/2 votes)
+   class: state recorded for input that was never reviewed
+   why: `if (hunterGap && ...) { ... round.count = Math.max(0, round.count - 1) }` says the run should be retried, but `for (const f of files) round.fileHashes[f.file] = f.hash` runs unconditionally after the hunters block. Round 2+ 'sends only files whose diff changed', so the rerun skips files a hunter never read and can turn green on unreviewed code.
+   fix: Only write round.fileHashes when every hunter answered (hunterGap is empty), or skip recording on the incomplete path.
+   also: hooks/register.tsx:818
+2. [IMPORTANT] hooks/register.tsx:432: Security-lens findings that miss the keyword list no longer block the gate (1/2 votes)
+   class: security gate narrowed by keyword match
+   why: Before: `f.lens === 'security'` decided what blocked (the README says security findings block regardless of tier). After: `isSecurity` requires `f.lens === 'security' && SECURITY_WORDS.test(f.cls + ' ' + f.title)`, and `open`, the security layer, and `cmdResolve` all use it. A security-lens nit such as 'race in token cache' matches no keyword, so it stops blocking.
+   fix: Keep the lens check as the gate: make isSecurity return f.lens === 'security' and use the keyword list only for display tagging.
+   also: hooks/register.tsx:461, hooks/register.tsx:820, hooks/register.tsx:872, hooks/register.tsx:1035, hooks/register.tsx:1427
+3. [IMPORTANT, security] hooks/register.tsx:454: Security-lens findings stop blocking unless their text matches SECURITY_WORDS (1/2 votes)
+   class: security finding downgraded by keyword match
+   why: isSecurity() now requires `f.lens === 'security' && SECURITY_WORDS.test(...)`. Previously any security-lens finding blocked (`f.lens === 'security'`). The list has no 'ownership', 'authorization', 'exposure of' or 'dependencies', so a security finding such as 'missing ownership check' or 'dependencies added without need' no longer counts as open in `open`, `sec`, or `cmdResolve`, and the gate can…
+   fix: Return true for every security-lens finding (`return f.lens === 'security'`), and use the keyword match only for display, if at all.
+   also: hooks/register.tsx:~821 (sec filter), hooks/register.tsx:~830 (open filter in converge), hooks/register.tsx:~1035 (cmdResolve stillOpen)
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

@@ -1,0 +1,32 @@
+review-layers · RED: 2 open findings · main (working tree changes) · 5 files · 100k tokens (14k cache reads) · 53s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    7 raised (7 distinct), 2 confirmed, 5 dropped
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 1 of 3
+  ✗ gate       push blocked until green
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.55s]
+
+1. [IMPORTANT, security lens] hooks/register.tsx:806: Findings on the same file within 40 lines and 60% word overlap are merged, discarding one bug (2/2 votes)
+   class: over-merge drops distinct findings
+   why: The merge loop keeps only the longer-why finding and appends instances. The `near` test allows `Math.abs(m.f.line - line) <= 40 && overlap >= 0.6`, and overlap divides by the smaller word set, so short class strings can match. Two different bugs in one function can collapse into one posted finding, and the other's title and fix are lost.
+   fix: Only merge when the lines are close and the class strings match, and never drop a distinct finding's title or fix silently.
+2. [IMPORTANT] hooks/register.tsx:342: Plugin checks call bare `claude`, not the CLAUDE override the repo's own REVIEW.md uses (1/2 votes)
+   class: hardcoded tool path ignores configured override
+   why: detectChecks pushes 'claude plugin validate .' and 'claude plugin test .' literally, while REVIEW.md documents `${CLAUDE:-$HOME/.local/bin/claude}`. The checks run in `sh -lc`, so if claude is not on that PATH the check exits non-zero, runChecks breaks, and the gate goes red on every run.
+   fix: Resolve the binary the same way REVIEW.md does (honour a CLAUDE env var, fall back to $HOME/.local/bin/claude) before building these commands.
+   also: hooks/register.tsx:343
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

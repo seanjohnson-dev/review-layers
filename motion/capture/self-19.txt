@@ -1,0 +1,20 @@
+review-layers · GREEN: high risk, round 1 · main (5 commits ahead of origin/main + working tree changes) · 7 files · 128k tokens (39k cache reads) · 1m 08s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/lib.ts is a path that always needs a person
+  ✓ hunters    1 raised (1 distinct), 0 confirmed, 1 dropped, diff trimmed by 4.6k chars
+  ✓ verifiers  voted
+  ✓ security   clean
+  ✓ converge   round 1 of 3
+  ▸ gate       high risk: /land approve to clear the push
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   22 pass
+   0 fail
+  Ran 22 tests across 3 files. [0.57s]
+
+High risk: a person reads the evidence above and runs /land approve <note> before this can be pushed.

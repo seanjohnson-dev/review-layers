@@ -1,0 +1,36 @@
+review-layers · RED: 2 open findings · main (working tree changes) · 7 files · 43k tokens · 25s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    4 raised (3 distinct), 3 confirmed, 0 dropped
+  ✓ verifiers  voted
+  ✗ security   1 open
+  ▸ converge   round 2 of 3
+  ✗ gate       push blocked until green
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   20 pass
+   0 fail
+  Ran 20 tests across 3 files. [0.57s]
+
+1. [IMPORTANT, security lens] hooks/lib.ts:137: Near-site merge overwrites the kept finding with the absorbed one, so an important finding can become a nit (3/3 votes)
+   class: severity downgraded when merging findings
+   why: In the second loop, `near.f = { ...x.f, lens: ... }` replaces the kept finding with the absorbed one whenever its `why` is longer, copying its `severity` unchanged. Only the fingerprint loop applies the strongest-severity rule, so a 'nit' with a longer why replaces an 'important' finding and the gate sees the weaker severity.
+   fix: After the near-merge replacement, set `near.f.severity` to the stronger of the two severities, as the fingerprint loop already does.
+   also: hooks/lib.ts:133, hooks/lib.ts:112, hooks/lib.ts:133 (Cross-fingerprint merge replaces the kept finding with the …)
+2. [IMPORTANT] hooks/lib.ts:113: Absorbing a near-duplicate finding can lower the kept severity (2/2 votes)
+   class: severity downgrade on merge
+   why: In the second pass, `if (String(x.f.why ?? '').length > ...) near.f = { ...x.f, ... }` replaces the kept finding with the absorbed one, so its severity wins. The severity max is only applied in the first pass (`had.f.severity = severity`), never here. An 'important' finding with a short why, absorbing a 'nit' with a longer why, comes out as 'nit'.
+   fix: Compute the max of near.f.severity and x.f.severity before the replacement, as the first pass does, and assign it to the replacing object.
+3. [nit] hooks/lib.ts:112: A finding with no severity wins the max comparison and sets severity to undefined (2/2 votes)
+   class: missing severity treated as important and overwrites real severity
+   why: `SEV[String(f.severity)] ?? 3` gives an undefined severity the value 3 (important). When an existing 'nit' is merged with a severity-less finding, `severity = f.severity` (undefined) is kept, so the merged finding loses its severity instead of keeping 'nit'.
+   fix: Treat a missing severity as the lowest rank, or fall back to the existing value when the incoming severity is absent.
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

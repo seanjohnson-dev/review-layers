@@ -1,0 +1,29 @@
+review-layers · GREEN: high risk, round 1 · main (working tree changes) · 7 files · 104k tokens (19k cache reads) · 58s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    2 raised (2 distinct), 1 confirmed, 1 dropped, diff trimmed by 2.7k chars
+  ✓ verifiers  voted
+  ✓ security   clean
+  ✓ converge   round 1 of 3
+  ▸ gate       high risk: /land approve to clear the push
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   21 pass
+   0 fail
+  Ran 21 tests across 3 files. [0.62s]
+
+1. [nit] hooks/lib.ts:83: hunkFor counts '\ No newline at end of file' markers as new-file lines (2/2 votes)
+   class: off-by-one in new-file line mapping
+   why: The loop `for (let r = 1, n = start; ...)` only skips '-' rows, so a '\ No newline at end of file' marker (or any other non-'+'/' ' row) increments n. Every line after such a marker is then mapped to the wrong row, so the 25-line window around the finding can land on the wrong code.
+   fix: Skip rows whose first character is '\' as well as '-' before incrementing n, and fall back to a window around the hunk start when the line is not found (at stays 0).
+
+1 nit listed above do not block.
+
+High risk: a person reads the evidence above and runs /land approve <note> before this can be pushed.
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

@@ -1,0 +1,31 @@
+review-layers · RED: 2 open findings · main (working tree changes) · 5 files · 61k tokens · 28s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    5 raised (5 distinct), 2 confirmed, 3 dropped
+  ✓ verifiers  voted
+  ✓ security   clean
+  ▸ converge   round 2 of 3
+  ✗ gate       push blocked until green
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.55s]
+
+1. [IMPORTANT] hooks/register.tsx:471: budgetDiff never trims when every file is under the cap but the total is over it (2/2 votes)
+   class: wrong loop termination in budget water-filling
+   why: The loop breaks on `if (!over.length || ...)`. With level=max and two files of 0.7*max each, `over` is empty, so it breaks at once with no per-file trim. The final `text.slice(0, max)` then drops the tail, which can remove a later source file. The SOURCE ranking and smallest-first ordering only affect the per-file map, so they are bypassed.
+   fix: Break only when the sum fits: lower `level` while `under + over.length*level > max`, and compute `room` from the sum of all sizes, not only the ones under the level.
+2. [IMPORTANT] hooks/register.tsx:775: Findings on the same file merge on word overlap alone, with no line check (2/2 votes)
+   class: over-merging distinct findings in dedupe
+   why: `const near = merged.find(m => m.f.file === x.f.file && ((line !== null && ... Math.abs(m.f.line - line) <= 6 && overlap(m.f) >= 0.3) || overlap(m.f) >= 0.6))`. The second arm ignores line distance, so two different bugs in one file with similar class/title words (e.g. 'unchecked null from API' at lines 10 and 300) collapse into one. Fewer open findings can turn a red gate green.
+   fix: Require line proximity for every merge, or require the overlap arm to also match `cls` exactly, and never merge when both lines are known and far apart.
+
+Every finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).

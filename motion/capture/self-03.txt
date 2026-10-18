@@ -1,0 +1,20 @@
+review-layers · GREEN: high risk, round 3 · main (working tree changes) · 4 files · 36k tokens · 20s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✓ hunters    0 raised (0 distinct), 0 confirmed, 0 dropped, 1 hunter did not answer
+  ✓ verifiers  nothing to vote on
+  ✓ security   clean
+  ✓ converge   round 3 of 3
+  ▸ gate       high risk: /land approve to clear the push
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ ${CLAUDE:-$HOME/.local/bin/claude} plugin test .  (ok, 1s)
+   14 pass
+   0 fail
+  Ran 14 tests across 2 files. [0.54s]
+
+High risk: a person reads the evidence above and runs /land approve <note> before this can be pushed.

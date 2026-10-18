@@ -1,0 +1,34 @@
+review-layers · GREEN: high risk, round 3 · main (working tree changes) · 7 files · 50k tokens · 36s
+  ✓ verify     2 checks green
+  ✓ risk tier  high: hooks/register.tsx is a path that always needs a person
+  ✗ hunters    3 raised (3 distinct), 2 confirmed, 1 dropped
+  ✓ verifiers  voted
+  ✓ security   clean
+  ✓ converge   round 3 of 3
+  ▸ gate       high risk: /land approve to clear the push
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   21 pass
+   0 fail
+  Ran 21 tests across 3 files. [0.56s]
+
+1. [nit] hooks/lib.ts:94: Earlier representative's file:line is lost when a later duplicate replaces it (2/2 votes)
+   class: merge drops absorbed site when representative is replaced
+   why: In the first loop, `if (!had.f.why && f.why) had.f = { ...f, lens: had.f.lens, instances: had.f.instances }` swaps the representative to the later finding, but `had.f`'s own `file:line` was never added to `instances` (only `f`'s site is appended, and only on the non-replacing path). The comment promises every absorbed site rides along as an instance.
+   fix: Before replacing `had.f`, push `${had.f.file}:${had.f.line ?? '?'}` into the new instances list, mirroring the near-site merge branch.
+2. [nit] hooks/lib.ts:123: When a later duplicate replaces the representative, the replaced finding's own file:line is never recorded as an instance (2/2 votes)
+   class: absorbed finding's site dropped on replacement
+   why: In the same-fingerprint branch `had.f = { ...f, lens: had.f.lens, instances: had.f.instances }` swaps the representative to the new site and only appends `${f.file}:${f.line}`; the old `had.f.line` is never added. The near-site branch has the same gap: `near.f = { ...x.f, ... instances: [...near-site, ...x.f.instances] }` omits x's own site (the `site` variable is only used in the else arm).
+   fix: Before replacing a representative, push its own `${file}:${line}` (and title) into the instances list of the replacement, in both the fingerprint and near-site branches.
+   also: hooks/lib.ts:138
+
+2 nits listed above do not block.
+
+High risk: a person reads the evidence above and runs /land approve <note> before this can be pushed.
+
+Handing the findings to Claude to fix and re-review (autoFix is on; /land resolve <n> <reason> to overrule one).
