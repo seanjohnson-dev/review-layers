@@ -57,7 +57,18 @@ type Pass = {
   scope: string
   humanTouches: number
 }
-type Round = { count: number; posted: Record<string, number>; fileHashes: Record<string, string>; resolved: Record<string, string> }
+// One piece of work is the changes against one base (see roundOf). count numbers its rounds and drives the
+// diff-only re-read; streak counts the rounds since the work last went green, which is what the cap judges.
+type Round = {
+  base?: string | null
+  count: number
+  streak?: number
+  converged?: boolean
+  reviewed?: Record<string, string> // the files and diff hashes of the last run, to recognise them when they land
+  posted: Record<string, number>
+  fileHashes: Record<string, string>
+  resolved: Record<string, string>
+}
 type Human = { approvals: number; resolves: number; landings: number; landingsNoPerson: number }
 type Project = { pass?: Pass; rounds: Record<string, Round>; tokens: number; runs: number; lastAt: number; findings: Finding[]; human?: Human }
 const humanOf = (p: Project): Human => (p.human ??= { approvals: 0, resolves: 0, landings: 0, landingsNoPerson: 0 })
@@ -67,6 +78,7 @@ type Snapshot = {
   root: string
   head: string | null
   branch: string
+  base: string | null
   baseName: string | null
   ahead: number
   diff: string
@@ -192,8 +204,36 @@ async function saveProject($: any, root: string, project: Project) {
 
 // ---------- git: what would be pushed, plus the working tree ----------
 
+// The round record for this branch's current piece of work. When the work lands (pushed by Claude or from a
+// terminal), the rounds, the posted findings and the resolved ones start over: a cap is about one piece of
+// work, and a /land resolve is about the code it was given for, not every later change to that file. A base
+// that moves for any other reason (a pull or rebase onto other people's commits) keeps the record, so it can
+// neither reset a failing change's cap nor drop a resolve. A record from before bases were kept starts over.
+async function roundOf($: any, root: string, project: Project, branch: string, base: string | null): Promise<Round> {
+  const r = project.rounds[branch]
+  if (r && r.base === base) return r
+  if (r && r.base !== undefined && !(await landedWork($, root, r, base))) {
+    r.base = base
+    return r
+  }
+  const fresh: Round = { base, count: 0, streak: 0, posted: {}, fileHashes: {}, resolved: {} }
+  project.rounds[branch] = fresh
+  return fresh
+}
+
+// The work landed when the move of the base carries every file of the last review with the same diff.
+// Anything unclear (no record, no base, history rewritten) counts as not landed: the stricter answer.
+async function landedWork($: any, root: string, r: Round, base: string | null): Promise<boolean> {
+  const reviewed = Object.entries(r.reviewed ?? {})
+  if (!reviewed.length || !r.base || !base) return false
+  const d = await sh($, ['git', 'diff', r.base, base, '--no-color', '--no-ext-diff', '--'], { cwd: root })
+  if (d.exitCode !== 0) return false
+  const moved = new Map((await splitDiff(d.stdout)).map(f => [f.file, f.hash]))
+  return reviewed.every(([file, hash]) => moved.get(file) === hash)
+}
+
 async function snapshot($: any, cwd: string): Promise<Snapshot> {
-  const none: Snapshot = { isRepo: false, root: cwd, head: null, branch: '', baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false }
+  const none: Snapshot = { isRepo: false, root: cwd, head: null, branch: '', base: null, baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false }
   const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
   if (top.exitCode !== 0) return none
   const root = top.stdout.trim()
@@ -242,7 +282,7 @@ async function snapshot($: any, cwd: string): Promise<Snapshot> {
     const c = await g('rev-list', '--count', base + '..HEAD')
     ahead = Number(c.stdout.trim()) || 0
   }
-  return { isRepo: true, root, head, branch, baseName, ahead, diff, untracked: untracked.length, dirty }
+  return { isRepo: true, root, head, branch, base, baseName, ahead, diff, untracked: untracked.length, dirty }
 }
 
 
@@ -622,7 +662,7 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   const files = allFiles.filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
   const diffHash = await sha(files.map(f => f.hash).join(','))
   const family = `${snap.branch}`
-  const round: Round = project.rounds[family] ?? { count: 0, posted: {}, fileHashes: {}, resolved: {} }
+  const round = await roundOf($, root, project, family, snap.base)
   const roundCap = Math.max(1, Number(args.options.roundCap ?? 3) || 3)
 
   if (files.length === 0) {
@@ -635,13 +675,17 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   // a run on the very same changes repeats nothing: the last verdict stands
   if (project.pass && project.pass.diffHash === diffHash && project.pass.status === 'green') {
     $.ui.status(undefined)
-    const v = viewOf(root, project, snap, layers.map(l => ({ ...l, state: 'pass', note: 'unchanged since the last green run' })), [], tokens, round.count)
+    const v = viewOf(root, project, snap, layers.map(l => ({ ...l, state: 'pass', note: 'unchanged since the last green run' })), [], tokens, round.streak ?? round.count)
     await update($, view, () => v)
-    return { text: `review-layers: these exact changes are already green (round ${round.count}, ${project.pass.tier} risk)${project.pass.approved || project.pass.tier === 'low' ? ', cleared to push.' : ': run /land approve to clear the push.'}`, context: [], view: v }
+    return { text: `review-layers: these exact changes are already green (round ${round.streak ?? round.count}, ${project.pass.tier} risk)${project.pass.approved || project.pass.tier === 'low' ? ', cleared to push.' : ': run /land approve to clear the push.'}`, context: [], view: v }
   }
 
+  // new work after a green run is a new attempt: the streak the cap judges starts again
+  if (round.converged) round.streak = 0
+  round.converged = false
   round.count += 1
-  current = { ...current, root, round: round.count }
+  round.streak = (round.streak ?? 0) + 1
+  current = { ...current, root, round: round.streak }
 
   // layer 1: verify, with the project's own checks
   const cmds = await detectChecks($, root, review, args.depth)
@@ -670,9 +714,9 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   let repeats: Finding[] = []
   let hunterNote = ''
   let hunterGap = ''
-  const overCap = round.count > roundCap
+  const overCap = round.streak > roundCap
   if (overCap) {
-    layer('hunters', 'skip', `round ${round.count} is past the cap of ${roundCap}: step back`)
+    layer('hunters', 'skip', `round ${round.streak} is past the cap of ${roundCap}: step back`)
     layer('verifiers', 'skip', '')
     layer('security', 'skip', '')
   } else if (checksFailed) {
@@ -748,13 +792,14 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   // layer 6: converge
   const open = [...findings, ...repeats].filter(f => f.severity === 'important' || isSecurity(f))
   const nits = findings.filter(f => f.severity === 'nit').length
-  layer('converge', overCap ? 'fail' : open.length ? 'run' : 'pass', overCap ? `${round.count} rounds: reconsider the approach` : `round ${round.count} of ${roundCap}`)
+  layer('converge', overCap ? 'fail' : open.length ? 'run' : 'pass', overCap ? `${round.streak} rounds: reconsider the approach` : `round ${round.streak} of ${roundCap}`)
 
   // layer 7: the gate's verdict
   const status: Pass['status'] = checksFailed || open.length || overCap || hunterGap ? 'red' : 'green'
   if (hunterGap && !open.length && !checksFailed && !overCap) {
     layer('hunters', 'fail', `not every hunter answered (${hunterGap}): run /land again`)
     round.count = Math.max(0, round.count - 1) // an API hiccup is not a review round
+    round.streak = Math.max(0, round.streak - 1)
   }
   const needsApproval = needsPerson(tier)
   const prior = project.pass && project.pass.diffHash === diffHash ? project.pass : undefined
@@ -773,6 +818,8 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   layer('gate', status === 'green' ? (needsApproval && !pass.approved ? 'run' : 'pass') : 'fail', status === 'green' ? (needsApproval && !pass.approved ? `${tier} risk: /land approve to clear the push` : 'cleared to push') : 'push blocked until green')
 
   project.pass = pass
+  round.converged = status === 'green'
+  round.reviewed = Object.fromEntries(files.map(f => [f.file, f.hash]))
   project.rounds[family] = round
   project.tokens += tokens
   project.runs += 1
@@ -780,14 +827,14 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   project.findings = [...findings, ...repeats].map(f => ({ ...f }))
   await saveProject($, root, project)
 
-  const v = viewOf(root, project, snap, layers, [...findings, ...repeats], tokens, round.count, evidence)
+  const v = viewOf(root, project, snap, layers, [...findings, ...repeats], tokens, round.streak, evidence)
   await update($, view, () => v)
   $.ui.status(undefined)
   void $.ui.open({ id: PANE, title: 'Review layers' })
 
   // the report
   const lines: string[] = []
-  const head = status === 'green' ? `GREEN: ${tier} risk, round ${round.count}` : overCap ? `STEP BACK: ${round.count} rounds on ${snap.branch} without converging` : hunterGap && !open.length && !checksFailed ? `INCOMPLETE: a hunter did not answer, run /land again` : `RED: ${open.length} open finding${open.length === 1 ? '' : 's'}${checksFailed ? ', checks failing' : ''}`
+  const head = status === 'green' ? `GREEN: ${tier} risk, round ${round.streak}` : overCap ? `STEP BACK: ${round.streak} rounds on ${snap.branch} without converging` : hunterGap && !open.length && !checksFailed ? `INCOMPLETE: a hunter did not answer, run /land again` : `RED: ${open.length} open finding${open.length === 1 ? '' : 's'}${checksFailed ? ', checks failing' : ''}`
   lines.push(`review-layers · ${head} · ${snap.branch} (${scopeLine(snap)}) · ${files.length} file${files.length === 1 ? '' : 's'} · ${kTokens(tokens)} tokens${cached ? ` (${kTokens(cached)} cache reads)` : ''} · ${secs(Date.now() - started)}`)
   for (const l of layers) lines.push(`  ${mark(l.state)} ${l.name.padEnd(10)} ${l.note}`)
   for (const e of evidence) lines.push(`\n$ ${e.cmd}  (${e.ok ? 'ok' : 'FAILED'}, ${secs(e.ms)})\n${e.tail.split('\n').map(x => '  ' + x).join('\n')}`)
@@ -901,7 +948,7 @@ async function cmdStatus($: any): Promise<string> {
   const snap = await snapshot($, cwd)
   const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file))
   const hash = await sha(files.map(f => f.hash).join(','))
-  const round = project?.rounds[snap.branch]?.count ?? 0
+  const round = project ? ((await roundOf($, root, project, snap.branch, snap.base)).streak ?? 0) : 0
   if (!project?.pass) return `review-layers: ${snap.branch} (${scopeLine(snap)}), ${files.length} file(s) changed, not reviewed yet. Run /land.`
   const p = project.pass
   const same = p.diffHash === hash
@@ -926,7 +973,7 @@ async function cmdApprove($: any, note: string): Promise<string> {
   project.pass.humanTouches = (project.pass.humanTouches ?? 0) + 1
   humanOf(project).approvals++
   await saveProject($, root, project)
-  const snapLite = { root, head: project.pass.head, branch: '', baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false, isRepo: true }
+  const snapLite = { root, head: project.pass.head, branch: '', base: null, baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false, isRepo: true }
   await update($, view, v => (v ? { ...viewOf(root, project, snapLite, v.layers, v.findings, v.tokens, v.round, v.evidence) } : v))
   return `Approved (${project.pass.tier} risk${note ? ': ' + note : ''}). You own this change: push and PR will go through.`
 }
@@ -943,10 +990,9 @@ async function cmdResolve($: any, args: string): Promise<string> {
   const project = await loadProject($, root)
   const f = project.findings.find(x => x.n === n)
   if (!f) return `No finding ${n} in the last run.`
-  const branch = (await sh($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root })).stdout.trim()
-  const round = project.rounds[branch] ?? { count: 0, posted: {}, fileHashes: {}, resolved: {} }
+  const snap = await snapshot($, root)
+  const round = await roundOf($, root, project, snap.branch, snap.base)
   round.resolved[f.fp] = reason
-  project.rounds[branch] = round
   f.status = 'resolved'
   humanOf(project).resolves++
   if (project.pass) project.pass.humanTouches = (project.pass.humanTouches ?? 0) + 1
@@ -1089,7 +1135,7 @@ async function cmdPr($: any): Promise<{ text: string; context?: string[] }> {
     '',
     '## Testing',
     ev,
-    `- review-layers: ${p.status} at round ${project.rounds ? Object.values(project.rounds).reduce((m, r) => Math.max(m, r.count), 0) : 1}, ${p.tier} risk${p.approved ? ', approved' + (p.note ? ': ' + p.note : '') : ''}`,
+    `- review-layers: ${p.status} at round ${project.rounds ? Object.values(project.rounds).reduce((m, r) => Math.max(m, r.streak ?? r.count), 0) : 1}, ${p.tier} risk${p.approved ? ', approved' + (p.note ? ': ' + p.note : '') : ''}`,
     '',
     '## Risk',
     `- Tier: ${p.tier}. ${p.tier === 'high' ? 'Touches a path that always needs a person.' : p.tier === 'medium' ? 'Ordinary product change.' : 'Additive or internal only.'}`,
@@ -1131,8 +1177,8 @@ export const register: Register = (on, options) => {
         const root = top.stdout.trim()
         const project = (await loadProjects($))[root]
         if (project?.pass) {
-          const snapLite: Snapshot = { root, head: project.pass.head, branch: '', baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false, isRepo: true }
-          await update($, view, () => viewOf(root, project, snapLite, [], project.findings ?? [], 0, Object.values(project.rounds).reduce((m, r) => Math.max(m, r.count), 0)))
+          const snapLite: Snapshot = { root, head: project.pass.head, branch: '', base: null, baseName: null, ahead: 0, diff: '', untracked: 0, dirty: false, isRepo: true }
+          await update($, view, () => viewOf(root, project, snapLite, [], project.findings ?? [], 0, Object.values(project.rounds).reduce((m, r) => Math.max(m, r.streak ?? r.count), 0)))
         }
       }
     } catch {
