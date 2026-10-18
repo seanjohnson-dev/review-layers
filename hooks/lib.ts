@@ -65,7 +65,8 @@ export function diffBody(text: string): string {
   // the header is everything before the first hunk; a content line that happens to start with
   // '---' or '+++' (a removed SQL comment, say) sits inside a hunk and is kept
   const at = text.search(/^@@ /m)
-  return at < 0 ? '' : text.slice(at)
+  // no hunk (a binary, a mode change, a pure rename): the header is all there is, so it is the content
+  return at < 0 ? text : text.slice(at)
 }
 
 export function fingerprint(f: { file: string; cls: string; title: string }): string {

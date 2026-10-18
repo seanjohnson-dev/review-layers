@@ -94,4 +94,8 @@ test('diffBody ignores how git labelled the change, so a commit does not change 
   expect(diffBody(sql)).toContain('--- old comment')
   expect(diffBody(sql.replace('+++ new comment', '+++ other comment'))).not.toBe(diffBody(sql))
   expect(diffBody(sql)).not.toContain('index 1..2')
+  // a change with no hunk keeps its header, which is the only thing that tells two of them apart
+  const bin = 'diff --git a/logo.png b/logo.png\nindex aaaa..bbbb 100644\nBinary files a/logo.png and b/logo.png differ\n'
+  expect(diffBody(bin)).not.toBe('')
+  expect(diffBody(bin)).not.toBe(diffBody(bin.replace('bbbb', 'cccc')))
 })
