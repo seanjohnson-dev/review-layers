@@ -12,6 +12,8 @@ A Claude Code mod that lands code the way the Claude Code team does, for one per
   <sub><a href="https://github.com/seanjohnson-dev/review-layers/releases/latest/download/review-layers-film.mp4">▶ Watch the 69-second film</a> · no narration, every word on screen is a real string from a real run · <a href="motion/">how it was made</a></sub>
 </p>
 
+> **Running agents other than Claude Code?** I'm weighing a metered `/land` service any agent can call. [Say so here](https://github.com/seanjohnson-dev/review-layers/issues/1) — a 👍 and one line about your setup is enough.
+
 ```
 /land
 review-layers · GREEN: medium risk, round 1 · feature/pricing (2 commits ahead of origin/main) · 4 files · 6.1k tokens · 41s

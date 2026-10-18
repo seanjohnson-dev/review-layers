@@ -1,0 +1,20 @@
+review-layers · GREEN: low risk, round 1 · main (working tree changes) · 2 files · 14k tokens · 6s
+  ✓ verify     2 checks green
+  ✓ risk tier  low: set by the classifier from the change
+  ✓ hunters    0 raised (0 distinct), 0 confirmed, 0 dropped
+  ✓ verifiers  nothing to vote on
+  ✓ security   clean
+  ✓ converge   round 1 of 3
+  ✓ gate       cleared to push
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin validate .  (ok, 1s)
+    ❯ ./register.tsx state writes: review-layers.view
+    ❯ ./register.tsx state reads: review-layers.view
+  ✔ Validation passed with warnings
+
+$ c="${CLAUDE:-$HOME/.local/bin/claude}"; [ -x "$c" ] || c=claude; "$c" plugin test .  (ok, 1s)
+   22 pass
+   0 fail
+  Ran 22 tests across 3 files. [0.58s]
+
+Cleared: low risk needs no typed approval. git push and gh pr create will go through.
