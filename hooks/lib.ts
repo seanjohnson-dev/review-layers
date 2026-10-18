@@ -62,11 +62,14 @@ export function budgetDiff(files: FileDiff[], max: number): { text: string; cut:
 // What a diff says, without how git labelled it: the same content before and after a commit, with a
 // different `index` line or a `new file mode`, hashes the same, so committing never invalidates a review.
 export function diffBody(text: string): string {
-  // the header is everything before the first hunk; a content line that happens to start with
-  // '---' or '+++' (a removed SQL comment, say) sits inside a hunk and is kept
+  // only the `index` line (blob ids, which a commit rewrites) and the ---/+++ file labels of the header are
+  // dropped; the path, mode and rename lines say what changed, and every line inside a hunk is content
   const at = text.search(/^@@ /m)
-  // no hunk (a binary, a mode change, a pure rename): the header is all there is, so it is the content
-  return at < 0 ? text : text.slice(at)
+  const header = at < 0 ? text : text.slice(0, at)
+  const body = at < 0 ? '' : text.slice(at)
+  // with no hunk (a binary) the blob ids on the index line are the only record of the content: keep them
+  const drop = at < 0 ? /^(--- |\+\+\+ )/ : /^(index [0-9a-f]+\.\.[0-9a-f]+|--- |\+\+\+ )/
+  return header.split('\n').filter(l => !drop.test(l)).join('\n') + body
 }
 
 export function fingerprint(f: { file: string; cls: string; title: string }): string {
@@ -92,7 +95,7 @@ export function hunkFor(files: FileDiff[], file: string, line: number | null): s
       let at = 0
       for (let r = 1, n = start; r < rows.length; r++) {
         const c = rows[r]![0]
-        if (c === '-') continue // not a line of the new file
+        if (c === '-' || c === '\\') continue // a removed line, or git's "No newline" marker: not a line of the new file
         if (n === line) { at = r; break }
         n++
       }
@@ -108,8 +111,8 @@ export function hunkFor(files: FileDiff[], file: string, line: number | null): s
 // every absorbed finding's site and title ride along as an instance.
 export type RawFinding = { file: string; line: number | null; severity?: string; class?: string; title?: string; why?: string; fix?: string; instances?: string[]; lens: string }
 export type Merged = { fp: string; f: RawFinding; seen: number }
-const SEV = { important: 3, nit: 2, 'pre-existing': 1 } as Record<string, number>
-const rank = (sev: unknown) => SEV[String(sev)] ?? 0
+const SEV = new Map<string, number>([['important', 3], ['nit', 2], ['pre-existing', 1]])
+const rank = (sev: unknown) => SEV.get(String(sev)) ?? 0
 const stronger = (a: unknown, b: unknown) => (rank(a) >= rank(b) ? a : b) as string | undefined
 export function mergeRaw(raw: RawFinding[]): Merged[] {
 const byFp = new Map<string, { f: any; seen: number }>()

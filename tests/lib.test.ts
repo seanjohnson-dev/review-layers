@@ -47,7 +47,7 @@ test('mergeRaw does not merge different bugs that only share a few words', async
 })
 
 test('hunkFor finds the hunk by the new-file line, counting removed rows out', async () => {
-  const text = ['diff --git a/f.js b/f.js', 'index 1..2 100644', '--- a/f.js', '+++ b/f.js', '@@ -1,3 +1,4 @@', ' a', '-gone', '+b', '+c', ' d'].join('\n') + '\n' + 'x'.repeat(3000)
+  const text = ['diff --git a/f.js b/f.js', 'index 1..2 100644', '--- a/f.js', '+++ b/f.js', '@@ -1,3 +1,4 @@', ' a', '-gone', '\\ No newline at end of file', '+b', '+c', ' d'].join('\n') + '\n' + 'x'.repeat(3000)
   const h = hunkFor([{ file: 'f.js', text, hash: 'h', added: 2, removed: 1 }], 'f.js', 3)
   expect(h).toContain('+c')
   expect(h).toContain('@@ -1,3 +1,4 @@')
@@ -81,6 +81,9 @@ test('the near-site merge keeps the stronger severity whichever wording survives
   expect(c.f.instances?.join(' ')).toContain('c.ts:7')
   const d = merged.find(m => m.f.file === 'd.ts')!
   expect(d.f.severity).toBe('nit')
+  // a made-up severity never outranks a real one, however it is spelled
+  const odd = mergeRaw([{ file: 'e.ts', line: 1, severity: 'nit', class: 'k', title: 't', lens: 'edges' }, { file: 'e.ts', line: 1, severity: 'constructor', class: 'k', title: 't', why: 'w', lens: 'edges' }])
+  expect(odd[0]!.f.severity).toBe('nit')
 })
 
 test('diffBody ignores how git labelled the change, so a commit does not change the hash', async () => {
@@ -98,4 +101,7 @@ test('diffBody ignores how git labelled the change, so a commit does not change 
   const bin = 'diff --git a/logo.png b/logo.png\nindex aaaa..bbbb 100644\nBinary files a/logo.png and b/logo.png differ\n'
   expect(diffBody(bin)).not.toBe('')
   expect(diffBody(bin)).not.toBe(diffBody(bin.replace('bbbb', 'cccc')))
+  // a rename or a mode flip with the same hunk is a different change
+  expect(diffBody(committed.replace(/n\.ts/g, 'm.ts'))).not.toBe(diffBody(committed))
+  expect(diffBody(committed.replace('new file mode 100644', 'new file mode 100755'))).not.toBe(diffBody(committed))
 })
