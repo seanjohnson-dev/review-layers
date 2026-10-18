@@ -27,6 +27,7 @@ function machine(on: any, opts: { diff?: string; head?: string; reply: Reply; fi
   // the shell beneath the gate: a push that is let through succeeds
   on('tool.call', { tool: 'Bash' }, async () => ({ result: 'ok' }))
   on('session.cwd', async () => ({ value: '/repo' }))
+  on('env.get', async () => ({ value: undefined }))
   on('session.model', async () => ({ value: 'claude-opus-5-5' }))
   on('ui.status', async () => ({ value: undefined }))
   on('ui.toast', async () => ({ value: undefined }))

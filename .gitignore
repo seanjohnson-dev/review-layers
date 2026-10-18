@@ -1,3 +1,6 @@
 .claude-plugin/types/
 .DS_Store
 *.log
+motion/out/
+motion/vendor/
+motion/data.js

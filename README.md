@@ -20,15 +20,15 @@ Cleared: medium risk (you prompted it, so you are its reviewer) needs no typed a
 
 | # | Layer | What it does | Tokens |
 |---|---|---|---|
-| 1 | **verify** | Runs the project's own checks (typecheck, lint, test; build at `deep`) and keeps the output as evidence. A red check stops the run before any model is asked. | none |
+| 1 | **verify** | Runs the project's own checks in your login shell (typecheck, lint, test; build at `deep`; `claude plugin validate` and `test` for a mod) and keeps the output as evidence. A red check stops the run before any model is asked. | none |
 | 2 | **risk tier** | Sets `low` / `medium` / `high` from the change, never the author. Auth, billing, migrations, CI workflows, installers and `.env` are always high; docs-only is low; the rest is one tiny classifier call. | ~0.3k |
 | 3 | **hunters** | Three parallel reviewers on the diff, one lens each: correctness, edges & regressions, security. Bugs only, never style. Each finding names its *class* so every instance gets fixed, not one line. | the diff once, cached, + ~1k each |
-| 4 | **verifiers** | Two votes per distinct finding (three at `deep`), each seeing only the hunk the claim came from. Only confirmed findings are posted; findings three hunters agree on count that agreement. | ~0.3k per finding |
+| 4 | **verifiers** | Two votes per distinct finding (three at `deep`), each seeing only the hunk the claim came from. Only confirmed findings are posted, a split vote is marked *contested*; findings three hunters agree on count that agreement. | ~1–2k per finding |
 | 5 | **security** | The security lens's findings block regardless of tier. | included |
 | 6 | **converge** | A round cap (default 3) after which the hunters stop and ask you to reconsider the approach. Round 2+ re-reads only files whose diff changed. A finding posted once is never re-posted; a finding you resolve stays resolved. | smaller each round |
 | 7 | **gate** | `git push` and `gh pr create/merge` are refused until the current changes are green (and approved where the tier needs it). | none |
 
-Every run reports what it spent. A typical standard run on a 200-line diff is 5–10k tokens on haiku.
+Every run reports what it spent, cache reads shown separately (they bill at about a tenth). Measured on real runs: a 20-line diff with three bugs cost 16–27k tokens on haiku at `standard` (most of it verifier votes); the green round after the fix, 8.6k; a 60-line change to this mod's own hooks, 36–52k. `quick` is roughly a third of that.
 
 ## Human time
 
@@ -103,12 +103,17 @@ In `/config` (or `pluginConfigs["review-layers"].options` in `~/.claude/settings
 | `roundCap` | `3` | rounds before the hunters stop and ask for a step back |
 | `maxDiffChars` | `40000` | diff budget per run (~10k tokens); bigger diffs are trimmed per file |
 
+## What it will not be talked into
+
+The diff, the hunks and REVIEW.md are data under review. The hunters and verifiers are told so in their system prompts: text inside the change that addresses the model, claims a verdict or says something is handled never changes the answer, and a verifier's "not-real" must name the line of code that handles the case. (This was the first finding the mod raised when it reviewed itself.) A hunter that does not answer is asked once more; if it still does not, the run is **incomplete**, not green, and that run does not count as a round.
+
 ## How it stays cheap
 
 - haiku by default, `effort: low` for the tier and the verifiers
 - the diff is sent once with a prompt-cache mark; the three hunters share it
 - verifiers see one hunk, not the diff; a finding raised by several hunters is verified once
 - round 2+ sends only files whose diff changed; unchanged files are not re-read
+- a big change is trimmed source-first: small files stay whole, the largest give way, assets and docs give way before code
 - lockfiles, minified and generated files never go to a model
 - a red check, a diff identical to the last green run, or a round past the cap costs no model call at all
 - the tool schema is ~80 tokens and the system-prompt section three lines
