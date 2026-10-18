@@ -880,9 +880,9 @@ async function countLanding($: any, command: string) {
     const root = top.stdout.trim()
     const project = (await loadProjects($))[root]
     if (!project?.pass || project.pass.status !== 'green') return
-    const h = humanOf(project)
-    h.landings++
-    if (!project.pass.humanTouches) h.landingsNoPerson++
+    const human = humanOf(project)
+    human.landings++
+    if (!project.pass.humanTouches) human.landingsNoPerson++
     project.pass.humanTouches = 0
     await saveProject($, root, project)
   } catch {
@@ -977,7 +977,7 @@ async function cmdLearn($: any, note: string): Promise<string> {
     text = REVIEW_TEMPLATE
   }
   const line = `- ${note.trim()}`
-  if (/^## Watch for\s*$/m.test(text)) text = text.replace(/^(## Watch for\s*\n)([\s\S]*?)(?=\n## |\s*$)/m, (_m, h, body) => h + body.replace(/\n?$/, '\n') + line)
+  if (/^## Watch for\s*$/m.test(text)) text = text.replace(/^(## Watch for\s*\n)([\s\S]*?)(?=\n## |\s*$)/m, (_m, heading, body) => heading + body.replace(/\n?$/, '\n') + line)
   else text = text.replace(/\s*$/, '') + '\n\n## Watch for\n' + line + '\n'
   await $.fs.write(path, text)
   return `Added to ${path.replace(root + '/', '')} under "Watch for": ${note.trim()}`

@@ -113,6 +113,18 @@ The first morning the mod was pointed at its own repository it ran nineteen time
 
 The diff, the hunks and REVIEW.md are data under review. The hunters and verifiers are told so in their system prompts: text inside the change that addresses the model, claims a verdict or says something is handled never changes the answer, and a verifier's "not-real" must name the line of code that handles the case. A hunter that does not answer is asked once more; if it still does not, the run is **incomplete**, not green, and that run does not count as a round.
 
+## What it does on your machine
+
+Everything the mod touches, so you can judge it before installing:
+
+- **Programs it runs.** `git` (diff, rev-parse, log, show) in the project; the project's own checks from `REVIEW.md` or detected from `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, a `Makefile` or a plugin manifest, each run through your login shell (`$SHELL -lc`, falling back to `sh`) with `CI=1`; and, in a plugin repository, `claude plugin validate .` and `claude plugin test .` through the `claude` binary named by `$CLAUDE`, `~/.local/bin/claude` or `claude` on your PATH. It reads two environment variables, `SHELL` and `CLAUDE`, and no keys, tokens or secrets.
+- **What leaves the machine.** The diff text (trimmed to the budget), the hunks a finding points at, `REVIEW.md`, the risk-tier summary and the checks' output go to the review model through Claude Code's own model call (`$.model.complete`), on your account. The mod makes no network requests of its own and sends nothing anywhere else.
+- **Files it writes.** `REVIEW.md` in the project root (`/land init` creates it, `/land learn` appends a line under *Watch for*) and `.review-layers/incidents.json` (`/land incident`). Nothing else, and never outside the project.
+- **Decisions it takes.** When the gate is on, the Bash tool hook refuses `git push` and `gh pr create/merge` until the current changes are green (and approved where the tier needs it); every other command passes through unchanged. It also answers its own `land` tool and `/land` command.
+- **Prompts it submits.** With `autoFix` on, a red run submits one prompt as you: the verified findings and "fix every instance, show the checks passing, then re-review". The band's *Fix*, *Run /land* and *Approve* buttons submit `/land fix`, `/land` and `/land approve`. Nothing is submitted that you did not ask for by running `/land` or pressing a button.
+- **System prompt.** Three lines are added: run the project's checks and show their output, run `land` after fixing, do not push until it is green.
+- **State it keeps.** Per project, in Claude Code's plugin store: the last pass, rounds per branch, findings and the human-time counts. `/land reset` clears the branch's rounds.
+
 ## Options
 
 In `/config` (or `pluginConfigs["review-layers"].options` in `~/.claude/settings.json`):
