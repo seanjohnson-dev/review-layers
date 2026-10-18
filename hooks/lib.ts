@@ -62,10 +62,10 @@ export function budgetDiff(files: FileDiff[], max: number): { text: string; cut:
 // What a diff says, without how git labelled it: the same content before and after a commit, with a
 // different `index` line or a `new file mode`, hashes the same, so committing never invalidates a review.
 export function diffBody(text: string): string {
-  return text
-    .split('\n')
-    .filter(line => !/^(diff --git |index [0-9a-f]+\.\.[0-9a-f]+|new file mode |deleted file mode |old mode |new mode |similarity index |rename (from|to) |--- |\+\+\+ )/.test(line))
-    .join('\n')
+  // the header is everything before the first hunk; a content line that happens to start with
+  // '---' or '+++' (a removed SQL comment, say) sits inside a hunk and is kept
+  const at = text.search(/^@@ /m)
+  return at < 0 ? '' : text.slice(at)
 }
 
 export function fingerprint(f: { file: string; cls: string; title: string }): string {

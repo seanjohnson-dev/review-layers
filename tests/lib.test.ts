@@ -89,4 +89,9 @@ test('diffBody ignores how git labelled the change, so a commit does not change 
   const changed = committed.replace('+b', '+c')
   expect(diffBody(untracked)).toBe(diffBody(committed))
   expect(diffBody(changed)).not.toBe(diffBody(committed))
+  // a content line that starts with --- or +++ is content, not header
+  const sql = 'diff --git a/q.sql b/q.sql\nindex 1..2 100644\n--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,2 @@\n--- old comment\n+++ new comment\n select 1;\n'
+  expect(diffBody(sql)).toContain('--- old comment')
+  expect(diffBody(sql.replace('+++ new comment', '+++ other comment'))).not.toBe(diffBody(sql))
+  expect(diffBody(sql)).not.toContain('index 1..2')
 })
