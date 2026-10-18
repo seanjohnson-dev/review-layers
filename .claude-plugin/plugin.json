@@ -5,7 +5,10 @@
   "author": {
     "name": "Sean Johnson"
   },
+  "homepage": "https://github.com/seanjohnson-dev/review-layers",
+  "repository": "https://github.com/seanjohnson-dev/review-layers",
   "license": "MIT",
+  "keywords": ["code-review", "agents", "git", "security", "haiku", "token-light"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "model": {

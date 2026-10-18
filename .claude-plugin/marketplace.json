@@ -1,6 +1,7 @@
 {
   "name": "review-layers",
   "owner": { "name": "Sean Johnson" },
+  "description": "review-layers: the Claude Code team's layered code review as a mod. /land runs checks, risk tier, parallel hunters, verifier votes and a security pass, then gates git push until green.",
   "plugins": [
     {
       "name": "review-layers",
