@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { budgetDiff, hunkFor, mergeRaw } from '../hooks/lib'
+import { budgetDiff, diffBody, hunkFor, mergeRaw } from '../hooks/lib'
 import type { FileDiff, RawFinding } from '../hooks/lib'
 
 const fd = (file: string, n: number): FileDiff => ({ file, text: `diff --git a/${file} b/${file}\n` + 'x'.repeat(Math.max(0, n - 30)), hash: file, added: 1, removed: 0 })
@@ -81,4 +81,12 @@ test('the near-site merge keeps the stronger severity whichever wording survives
   expect(c.f.instances?.join(' ')).toContain('c.ts:7')
   const d = merged.find(m => m.f.file === 'd.ts')!
   expect(d.f.severity).toBe('nit')
+})
+
+test('diffBody ignores how git labelled the change, so a commit does not change the hash', async () => {
+  const untracked = 'diff --git a/n.ts b/n.ts\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/n.ts\n@@ -0,0 +1,2 @@\n+a\n+b\n'
+  const committed = 'diff --git a/n.ts b/n.ts\nnew file mode 100644\nindex 0000000..2222222\n--- /dev/null\n+++ b/n.ts\n@@ -0,0 +1,2 @@\n+a\n+b\n'
+  const changed = committed.replace('+b', '+c')
+  expect(diffBody(untracked)).toBe(diffBody(committed))
+  expect(diffBody(changed)).not.toBe(diffBody(committed))
 })

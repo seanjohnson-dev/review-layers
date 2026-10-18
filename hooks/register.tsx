@@ -15,7 +15,7 @@
 
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
-import { GENERATED, SOURCE, budgetDiff, clip, fingerprint, hunkFor, mergeRaw } from './lib'
+import { GENERATED, SOURCE, budgetDiff, clip, diffBody, fingerprint, hunkFor, mergeRaw } from './lib'
 import type { FileDiff } from './lib'
 import type {
   ReviewLayersEvidence as Evidence,
@@ -258,7 +258,7 @@ async function splitDiff(diff: string): Promise<FileDiff[]> {
       if (line.startsWith('+') && !line.startsWith('+++')) added++
       else if (line.startsWith('-') && !line.startsWith('---')) removed++
     }
-    out.push({ file, text, hash: await sha(text), added, removed })
+    out.push({ file, text, hash: await sha(diffBody(text)), added, removed })
   }
   return out
 }
