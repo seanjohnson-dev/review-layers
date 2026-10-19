@@ -13,6 +13,7 @@ export type ReviewLayersFinding = {
   of: number
   status: 'open' | 'resolved' | 'repeat' | 'dropped'
   fp: string
+  unverified?: boolean // kept open because too few verifiers gave a readable verdict
 }
 
 export type ReviewLayersLayer = {

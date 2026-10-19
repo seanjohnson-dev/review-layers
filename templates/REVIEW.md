@@ -14,7 +14,7 @@ than a guess from a name.
 - (lessons go here: `/land learn "<note>"` appends one)
 
 ## Skip
-- Generated files, lockfiles, snapshots
+- (globs never sent to the reviewer, e.g. docs/generated/**; lockfiles and build output are skipped already)
 
 ## Always human
 - (globs that always need a person, e.g. `src/billing/**`, `.github/workflows/**`)

@@ -1,6 +1,6 @@
 {
   "name": "review-layers",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Layered code review for agent-written changes, the way the Claude Code team lands code: checks run first, a risk tier is set from the change, parallel bug hunters post only findings that verifiers confirm, security findings block, review rounds are capped, repeated lessons go into REVIEW.md, incidents become an eval, and git push / gh pr are gated until /land is green. Token-light: haiku by default, the diff sent once and cached, later rounds re-read only what changed.",
   "author": {
     "name": "Sean Johnson"
@@ -9,7 +9,7 @@
   "repository": "https://github.com/seanjohnson-dev/review-layers",
   "documentationUrl": "https://github.com/seanjohnson-dev/review-layers#readme",
   "supportUrl": "https://github.com/seanjohnson-dev/review-layers/issues",
-  "privacyPolicyUrl": "https://github.com/seanjohnson-dev/review-layers#what-it-does-on-your-machine",
+  "privacyPolicyUrl": "https://github.com/seanjohnson-dev/review-layers/blob/main/PRIVACY.md",
   "license": "MIT",
   "keywords": ["code-review", "agents", "git", "security", "haiku", "token-light"],
   "types": "./types/index.d.ts",

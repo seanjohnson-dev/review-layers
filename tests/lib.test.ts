@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { budgetDiff, diffBody, hunkFor, mergeRaw } from '../hooks/lib'
+import { batchDiff, budgetDiff, diffBody, hunkFor, isPersonOrigin, mergeRaw, splitFile } from '../hooks/lib'
 import type { FileDiff, RawFinding } from '../hooks/lib'
 
 const fd = (file: string, n: number): FileDiff => ({ file, text: `diff --git a/${file} b/${file}\n` + 'x'.repeat(Math.max(0, n - 30)), hash: file, added: 1, removed: 0 })
@@ -104,4 +104,56 @@ test('diffBody ignores how git labelled the change, so a commit does not change 
   // a rename or a mode flip with the same hunk is a different change
   expect(diffBody(committed.replace(/n\.ts/g, 'm.ts'))).not.toBe(diffBody(committed))
   expect(diffBody(committed.replace('new file mode 100644', 'new file mode 100755'))).not.toBe(diffBody(committed))
+})
+
+const hunky = (file: string, hunks: number, rows: number): FileDiff => ({
+  file,
+  hash: file,
+  added: hunks * rows,
+  removed: 0,
+  text:
+    `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n` +
+    Array.from({ length: hunks }, (_, h) => `@@ -${h * 100 + 1},0 +${h * 100 + 1},${rows} @@\n` + Array.from({ length: rows }, (_, i) => `+const h${h}r${i} = ${i} // padding so each row has some width`).join('\n')).join('\n'),
+})
+
+test('splitFile cuts a big file between hunks and repeats the header', async () => {
+  const f = hunky('src/big.ts', 6, 20)
+  const pieces = splitFile(f, 3000)
+  expect(pieces.length).toBeGreaterThan(1)
+  for (const p of pieces) {
+    expect(p.text.startsWith('diff --git a/src/big.ts b/src/big.ts\n--- a/src/big.ts\n+++ b/src/big.ts\n@@ ')).toBe(true)
+    expect(p.text.length).toBeLessThanOrEqual(3000)
+  }
+  // every hunk is in exactly one piece
+  for (let h = 0; h < 6; h++) expect(pieces.filter(p => p.text.includes(`const h${h}r19 `))).toHaveLength(1)
+})
+
+test('batchDiff reads one file bigger than the budget whole, across parts', async () => {
+  const { parts, cut, trimmed } = batchDiff([hunky('src/big.ts', 6, 20)], 3000, 3)
+  expect(cut).toBe(0)
+  expect(trimmed).toHaveLength(0)
+  expect(parts.length).toBeGreaterThan(1)
+  for (let h = 0; h < 6; h++) expect(parts.some(p => p.includes(`const h${h}r19 `))).toBe(true)
+})
+
+test('batchDiff names what it could not fit in its parts', async () => {
+  const { cut, trimmed } = batchDiff([hunky('src/a.ts', 6, 20), hunky('src/b.ts', 6, 20)], 3000, 2)
+  expect(cut).toBeGreaterThan(0)
+  expect(trimmed.length).toBeGreaterThan(0)
+})
+
+test('batchDiff leaves a diff that fits as one part', async () => {
+  const { parts, cut } = batchDiff([hunky('src/a.ts', 1, 5)], 40000, 3)
+  expect(parts).toHaveLength(1)
+  expect(cut).toBe(0)
+})
+
+test('a sign-off counts only from a person', async () => {
+  for (const kind of ['composer', 'bridge', 'sdk']) expect(isPersonOrigin({ kind }, 'review-layers')).toBe(true)
+  for (const kind of ['peer', 'peer-send-message', 'coordinator', 'scheduled-trigger', 'task-notification', 'channel', 'observer']) expect(isPersonOrigin({ kind }, 'review-layers')).toBe(false)
+  expect(isPersonOrigin({ kind: 'plugin', name: 'review-layers' }, 'review-layers')).toBe(true)
+  expect(isPersonOrigin({ kind: 'plugin', name: 'some-other-mod' }, 'review-layers')).toBe(false)
+  for (const o of [{}, { kind: '' }, { kind: 'unclassified' }, { kind: 'something-new' }, 'composer']) expect(isPersonOrigin(o, 'review-layers')).toBe(false)
+  // an engine that stamps no origin at all: the command is the person's, as before origins existed
+  expect(isPersonOrigin(undefined, 'review-layers')).toBe(true)
 })

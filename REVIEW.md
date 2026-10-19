@@ -12,6 +12,7 @@
 
 ## Skip
 - motion/**
+- docs/self-review/**
 - templates/**
 
 ## Always human

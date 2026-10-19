@@ -10,9 +10,9 @@ export function clip(s: unknown, n: number): string {
 }
 
 export const SOURCE = /\.(tsx?|jsx?|mjs|cjs|mts|cts|py|go|rs|java|kt|swift|rb|php|cs|c|cc|cpp|h|hpp|sql|sh|zsh|bash|vue|svelte|prisma|graphql|proto|tf|ya?ml|toml)$|(^|\/)(package|plugin|tsconfig|composer)\.json$/i
-export function budgetDiff(files: FileDiff[], max: number): { text: string; cut: number } {
+export function budgetDiff(files: FileDiff[], max: number): { text: string; cut: number; trimmed: string[] } {
   const total = files.reduce((n, f) => n + f.text.length, 0)
-  if (total <= max) return { text: files.map(f => f.text).join('\n'), cut: 0 }
+  if (total <= max) return { text: files.map(f => f.text).join('\n'), cut: 0, trimmed: [] }
   // water-filling over one group: smallest first, each takes what it needs while an equal share of what is
   // left would cover it; the first that would not fit sets the level every larger one is cut to
   const levelFor = (group: FileDiff[], budget: number) => {
@@ -32,10 +32,12 @@ export function budgetDiff(files: FileDiff[], max: number): { text: string; cut:
   const sourceSpent = source.reduce((n, f) => n + Math.min(f.text.length, sourceLevel), 0)
   const restLevel = levelFor(rest, Math.max(0, max - sourceSpent))
   let cut = 0
+  const trimmed = new Set<string>()
   const kept = new Map<FileDiff, string>()
   const place = (f: FileDiff, level: number) => {
     if (f.text.length <= level) kept.set(f, f.text)
     else {
+      trimmed.add(f.file)
       cut += f.text.length - level
       kept.set(f, f.text.slice(0, level) + `\n[... review-layers cut ${f.text.length - level} characters of this file's diff]`)
     }
@@ -54,9 +56,10 @@ export function budgetDiff(files: FileDiff[], max: number): { text: string; cut:
     cut += Math.min(t.length, f.text.length) // what was still kept of it; its trim was counted already
     kept.delete(f)
     dropped.push(f.file)
+    trimmed.add(f.file)
   }
   const text = files.filter(f => kept.has(f)).map(f => kept.get(f)!).join('\n') + (dropped.length ? `\n[... review-layers left out ${dropped.length} file(s) for room: ${dropped.join(', ')}]` : '')
-  return { text, cut }
+  return { text, cut, trimmed: [...trimmed] }
 }
 
 // What a diff says, without how git labelled it: the same content before and after a commit, with a
@@ -153,4 +156,72 @@ const byFp = new Map<string, { f: any; seen: number }>()
     } else merged.push({ fp, f: x.f, seen: x.seen })
   }
   return merged
+}
+
+// Splits a diff too big for one read into up to maxParts parts, each within max, so every file is read.
+// Files are spread largest first onto the lightest part. Only what still does not fit is trimmed (by
+// budgetDiff, per part), and cut says how much: a run with cut > 0 has not read the whole change.
+export function batchDiff(files: FileDiff[], max: number, maxParts: number): { parts: string[]; cut: number; trimmed: string[] } {
+  const total = files.reduce((n, f) => n + f.text.length + 1, 0)
+  if (total <= max) return { parts: files.length ? [files.map(f => f.text).join('\n')] : [], cut: 0, trimmed: [] }
+  // a file bigger than one part is split at its hunks, each piece carrying the file's header
+  const pieces = files.flatMap(f => splitFile(f, max))
+  // first fit, largest first: a piece goes in the first part with room, or a new part while there may be
+  // more; only when every part is full does a piece go to the lightest part, where budgetDiff trims it
+  const bins: { size: number; files: FileDiff[] }[] = []
+  for (const f of [...pieces].sort((a, b) => b.text.length - a.text.length)) {
+    const need = f.text.length + 1
+    let bin = bins.find(b => b.size + need <= max)
+    if (!bin && bins.length < maxParts) bins.push((bin = { size: 0, files: [] }))
+    bin ??= bins.reduce((m, b) => (b.size < m.size ? b : m), bins[0]!)
+    bin.files.push(f)
+    bin.size += need
+  }
+  let cut = 0
+  const trimmed: string[] = []
+  const parts: string[] = []
+  for (const bin of bins) {
+    if (!bin.files.length) continue
+    // keep the files in the order git gave them, so a part reads like a diff
+    const ordered = pieces.filter(f => bin.files.includes(f))
+    const b = budgetDiff(ordered, max)
+    cut += b.cut
+    trimmed.push(...b.trimmed)
+    parts.push(b.text)
+  }
+  return { parts, cut, trimmed: [...new Set(trimmed)] }
+}
+
+// one file's diff in pieces of at most max characters, cut between hunks; a single hunk bigger than max
+// stays whole here (budgetDiff trims it and says so)
+export function splitFile(f: FileDiff, max: number): FileDiff[] {
+  if (f.text.length <= max) return [f]
+  const at = f.text.search(/\n@@ /)
+  if (at < 0) return [f]
+  const header = f.text.slice(0, at)
+  const hunks = f.text.slice(at + 1).split(/\n(?=@@ )/)
+  const out: FileDiff[] = []
+  let cur = ''
+  for (const h of hunks) {
+    if (cur && header.length + 1 + cur.length + 1 + h.length > max) {
+      out.push({ ...f, text: header + '\n' + cur })
+      cur = ''
+    }
+    cur = cur ? cur + '\n' + h : h
+  }
+  if (cur) out.push({ ...f, text: header + '\n' + cur })
+  return out
+}
+
+// Whether a command came from a person: only the sources the engine stamps as a person's own (their Enter at
+// the prompt, their phone through Remote Control, their app or `claude -p`, a follow-up to their own click)
+// and this mod's own button. Any other stamp is not a person, an unknown or empty kind included. A command
+// with no origin at all comes from an engine that stamps none (versions before origins, the test kit); there
+// it is taken as the person's, as every command was before, and the Bash hook still blocks the model's route.
+const PERSON = new Set(['composer', 'bridge', 'sdk', 'auto-continuation'])
+export function isPersonOrigin(origin: unknown, self: string): boolean {
+  if (origin === undefined || origin === null) return true
+  const o = origin as { kind?: unknown; name?: unknown }
+  if (o.kind === 'plugin') return o.name === self
+  return typeof o.kind === 'string' && PERSON.has(o.kind)
 }

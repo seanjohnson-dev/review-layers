@@ -1,3 +1,0 @@
-ℹ tests 5
-ℹ pass 5
-ℹ fail 0

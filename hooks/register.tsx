@@ -15,7 +15,7 @@
 
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
-import { GENERATED, SOURCE, budgetDiff, clip, diffBody, fingerprint, hunkFor, mergeRaw } from './lib'
+import { GENERATED, SOURCE, batchDiff, budgetDiff, clip, isPersonOrigin, diffBody, fingerprint, hunkFor, mergeRaw } from './lib'
 import type { FileDiff } from './lib'
 import type {
   ReviewLayersEvidence as Evidence,
@@ -40,6 +40,10 @@ const autoFix = () => OPTS.autoFix !== false
 function needsPerson(tier: Tier): boolean {
   return tier === 'high' || (tier === 'medium' && approvalsMode() === 'strict')
 }
+// a run that did not read the whole change also needs a person, whatever the tier
+function passNeedsPerson(p: { tier: Tier; partial?: string }): boolean {
+  return needsPerson(p.tier) || !!p.partial
+}
 
 type Depth = 'quick' | 'standard' | 'deep'
 type Tier = 'low' | 'medium' | 'high'
@@ -56,7 +60,11 @@ type Pass = {
   open: number
   scope: string
   humanTouches: number
+  // why a red run is red apart from its findings; a resolve cannot clear these. Absent on records from 0.1.2.
+  blockers?: Blocker[]
+  partial?: string // what the run did not read, when it did not read everything
 }
+type Blocker = 'checks' | 'cap' | 'incomplete' | 'untrusted'
 // One piece of work is the changes against one base (see roundOf). count numbers its rounds and drives the
 // diff-only re-read; streak counts the rounds since the work last went green, which is what the cap judges.
 type Round = {
@@ -70,7 +78,7 @@ type Round = {
   resolved: Record<string, string>
 }
 type Human = { approvals: number; resolves: number; landings: number; landingsNoPerson: number }
-type Project = { pass?: Pass; rounds: Record<string, Round>; tokens: number; runs: number; lastAt: number; findings: Finding[]; human?: Human }
+type Project = { pass?: Pass; rounds: Record<string, Round>; tokens: number; runs: number; lastAt: number; findings: Finding[]; human?: Human; trustedRules?: string }
 const humanOf = (p: Project): Human => (p.human ??= { approvals: 0, resolves: 0, landings: 0, landingsNoPerson: 0 })
 
 type Snapshot = {
@@ -83,8 +91,14 @@ type Snapshot = {
   ahead: number
   diff: string
   untracked: number
+  unread?: string[] // new files past MAX_UNTRACKED, left out of the diff: the run says so and cannot clear itself
   dirty: boolean
 }
+
+// how many new (untracked) files a run reads; past this the rest are named and the run needs a person
+const MAX_UNTRACKED = 200
+// how many parts a diff bigger than the budget is read in before anything is trimmed
+const MAX_PARTS = 3
 
 const HELP =
   '/land [quick|standard|deep] [focus]: run every layer on the changes that would be pushed\n' +
@@ -94,6 +108,7 @@ const HELP =
   '/land approve [note]: the human sign-off a medium or high tier needs before push\n' +
   '/land learn <note>: add a lesson to REVIEW.md so the reviewer looks for it next time\n' +
   '/land init: write a starter REVIEW.md for this project\n' +
+  '/land trust: allow REVIEW.md\'s check commands, Skip and Always human rules (asked again whenever they change)\n' +
   '/land incident <commit> <what broke>: add a past incident to the eval set\n' +
   '/land eval: re-run the hunters over every incident and report recall\n' +
   '/land pr: a PR body with Testing, Risk and How to revert filled from the last run\n' +
@@ -118,6 +133,36 @@ async function sha(text: string): Promise<string> {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
 }
 
+
+// what the gate compares: the reviewed files' diffs, plus the names of new files the run could not read
+async function changeHash(files: FileDiff[], snap: { unread?: string[] }): Promise<string> {
+  const unread = snap.unread?.length ? ',unread:' + snap.unread.join(',') : ''
+  return sha(files.map(f => f.hash).join(',') + unread)
+}
+
+// REVIEW.md's rules decide what runs and what is reviewed: its check commands, its Skip globs (files never
+// read) and its Always human globs (what forces a person's sign-off). They take effect only as a person
+// allowed them with /land trust; an edit to any of them (by an agent, or in a pulled commit) asks again.
+async function rulesHash(review: ReviewMd): Promise<string> {
+  return sha('rules\n' + review.rules.join('\n'))
+}
+async function rulesTrusted(project: Project | undefined, review: ReviewMd): Promise<boolean> {
+  if (!project?.trustedRules) return review.rules.length === 0
+  return (await rulesHash(review)) === project.trustedRules
+}
+function rulesList(review: ReviewMd): string {
+  const group = (kind: string, title: string) => {
+    const lines = review.rules.filter(r => r.startsWith(kind + ': ')).map(r => '  ' + r.slice(kind.length + 2))
+    return lines.length ? `${title}:\n${lines.join('\n')}` : ''
+  }
+  return [group('check', 'Check commands it runs'), group('skip', 'Files it never reviews (Skip)'), group('human', 'Files that always need a person (Always human)')].filter(Boolean).join('\n') || '  (none: every rule was removed)'
+}
+
+function unreadSummary(files: string[], chars: number): string {
+  const names = [...new Set(files)]
+  const shown = names.slice(0, 5).join(', ') + (names.length > 5 ? ` and ${names.length - 5} more` : '')
+  return `${names.length} file${names.length === 1 ? '' : 's'} not read in full${chars ? ` (${kTokens(chars)} chars of diff)` : ''}${names.length ? ': ' + shown : ''}`
+}
 
 function tail(s: string, lines: number): string {
   const all = s.replace(/\r/g, '').split('\n').filter(l => l.trim())
@@ -156,29 +201,38 @@ function cachedOf(r: any): number {
   return r?.usage?.cache_read_input_tokens || 0
 }
 
-function parseJsonArray(text: string): any[] {
+// null when the answer is not a JSON array: a cut-off or garbled reply is a failed reviewer, never "no bugs"
+function parseJsonArray(text: string): any[] | null {
   const t = String(text ?? '').replace(/```(?:json)?/g, '')
   const a = t.indexOf('[')
   const b = t.lastIndexOf(']')
-  if (a < 0 || b <= a) return []
+  if (a < 0 || b <= a) return null
   try {
     const v = JSON.parse(t.slice(a, b + 1))
-    return Array.isArray(v) ? v : []
+    return Array.isArray(v) ? v : null
   } catch {
-    return []
+    return null
   }
 }
 
-function parseJsonObject(text: string): any {
+// null when the answer is not a JSON object
+function parseJsonObject(text: string): any | null {
   const t = String(text ?? '').replace(/```(?:json)?/g, '')
   const a = t.indexOf('{')
   const b = t.lastIndexOf('}')
-  if (a < 0 || b <= a) return {}
+  if (a < 0 || b <= a) return null
   try {
-    return JSON.parse(t.slice(a, b + 1)) ?? {}
+    const v = JSON.parse(t.slice(a, b + 1))
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null
   } catch {
-    return {}
+    return null
   }
+}
+
+// a verifier's verdict, or null when the reply is not one: a garbled reply abstains, it never votes "not real"
+function verdictOf(text: string): 'real' | 'not-real' | 'pre' | null {
+  const v = String(parseJsonObject(text)?.verdict ?? '').toLowerCase().trim()
+  return v.startsWith('real') ? 'real' : v.startsWith('pre') ? 'pre' : v.startsWith('not') ? 'not-real' : null
 }
 
 // ---------- the store: one record per project root ----------
@@ -271,9 +325,9 @@ async function snapshot($: any, cwd: string): Promise<Snapshot> {
   const dirtyR = await g('status', '--porcelain')
   const dirty = dirtyR.stdout.trim().length > 0
   const un = await g('ls-files', '--others', '--exclude-standard')
-  const untracked = un.stdout.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 40)
-  for (const f of untracked) {
-    if (GENERATED.test(f)) continue
+  const untracked = un.stdout.split('\n').map(s => s.trim()).filter(Boolean).filter(f => !GENERATED.test(f))
+  const unread = untracked.slice(MAX_UNTRACKED)
+  for (const f of untracked.slice(0, MAX_UNTRACKED)) {
     const d = await g('diff', '--no-index', '--no-color', '--', '/dev/null', f)
     if (d.stdout) diff += (diff && !diff.endsWith('\n') ? '\n' : '') + d.stdout
   }
@@ -282,7 +336,7 @@ async function snapshot($: any, cwd: string): Promise<Snapshot> {
     const c = await g('rev-list', '--count', base + '..HEAD')
     ahead = Number(c.stdout.trim()) || 0
   }
-  return { isRepo: true, root, head, branch, base, baseName, ahead, diff, untracked: untracked.length, dirty }
+  return { isRepo: true, root, head, branch, base, baseName, ahead, diff, untracked: untracked.length, unread, dirty }
 }
 
 
@@ -326,7 +380,7 @@ nits, and ask for evidence (a file and line) rather than a guess.
 - (lessons go here: /land learn "<note>")
 
 ## Skip
-- Generated files, lockfiles, snapshots
+- (globs never sent to the reviewer, e.g. docs/generated/**; lockfiles and build output are skipped already)
 
 ## Always human
 - (globs that always need a person: e.g. src/billing/**)
@@ -335,10 +389,10 @@ nits, and ask for evidence (a file and line) rather than a guess.
 - (optional: commands to run as evidence, one per line, e.g. npm test)
 `
 
-type ReviewMd = { text: string; checks: string[]; alwaysHuman: RegExp[]; skip: RegExp[]; path: string | null }
+type ReviewMd = { text: string; checks: string[]; alwaysHuman: RegExp[]; skip: RegExp[]; rules: string[]; path: string | null }
 
 async function readReviewMd($: any, root: string): Promise<ReviewMd> {
-  const empty: ReviewMd = { text: '', checks: [], alwaysHuman: [], skip: [], path: null }
+  const empty: ReviewMd = { text: '', checks: [], alwaysHuman: [], skip: [], rules: [], path: null }
   for (const p of [root + '/REVIEW.md', root + '/.claude/REVIEW.md']) {
     let text = ''
     try {
@@ -351,11 +405,15 @@ async function readReviewMd($: any, root: string): Promise<ReviewMd> {
       const m = new RegExp('^##\\s+' + name + '\\s*$([\\s\\S]*?)(?=^##\\s|\\s*$(?![\\s\\S]))', 'im').exec(text)
       return m ? m[1]!.split('\n').map(l => l.replace(/^\s*[-*]\s*/, '').trim()).filter(l => l && !l.startsWith('(')) : []
     }
+    const checks = section('Checks')
+    const skip = section('Skip')
+    const human = section('Always human')
     return {
       text: text.slice(0, 4000),
-      checks: section('Checks'),
-      alwaysHuman: section('Always human').map(globToRegExp),
-      skip: section('Skip').map(globToRegExp),
+      checks,
+      alwaysHuman: human.map(globToRegExp),
+      skip: skip.map(globToRegExp),
+      rules: [...checks.map(c => 'check: ' + c), ...skip.map(g => 'skip: ' + g), ...human.map(g => 'human: ' + g)],
       path: p,
     }
   }
@@ -434,11 +492,12 @@ async function runChecks($: any, root: string, cmds: string[], onStep: (s: strin
 
 // ---------- layer 2: the risk tier, from the change ----------
 
-async function riskTier($: any, model: string, files: FileDiff[], review: ReviewMd, spend: (r: any) => void): Promise<{ tier: Tier; why: string }> {
+async function riskTier($: any, model: string, files: FileDiff[], review: ReviewMd, spend: (r: any) => void, useModel = true): Promise<{ tier: Tier; why: string }> {
   const names = files.map(f => f.file)
   const hit = names.find(n => ALWAYS_HUMAN.some(re => re.test(n)) || review.alwaysHuman.some(re => re.test(n)))
   if (hit) return { tier: 'high', why: `${hit} is a path that always needs a person` }
   if (names.length && names.every(n => DOCS_ONLY.test(n))) return { tier: 'low', why: 'docs and copy only' }
+  if (!useModel) return { tier: 'medium', why: 'medium for now (not classified: the run stops before review, so no model call)' }
   const stat = files.map(f => `${f.file} +${f.added} -${f.removed}`).join('\n').slice(0, 3000)
   const r = await $.model.complete({
     model,
@@ -499,7 +558,7 @@ function pickModel(options: Record<string, unknown>, sessionModel: string, depth
 async function hunt($: any, args: {
   model: string
   depth: Depth
-  diffText: string
+  batches: string[] // the diff, in one or more parts that each fit the budget; every part is read by every lens
   review: ReviewMd
   focus: string
   spend: (r: any) => void
@@ -507,43 +566,56 @@ async function hunt($: any, args: {
   signal?: AbortSignal
 }): Promise<{ raw: any[]; failed: number; reasons: string[] }> {
   const lenses: Lens[] = args.depth === 'quick' ? ['correctness'] : ['correctness', 'edges', 'security']
-  const shared = [
-    { text: (args.review.text ? `<REVIEW.md>\n${args.review.text}\n</REVIEW.md>\n\n` : '') + `<diff>\n${args.diffText}\n</diff>`, cache: true },
-  ]
-  args.onStep(`hunters: ${lenses.length} reading the diff`)
+  const batches = args.batches.filter(t => t.trim())
+  const many = batches.length > 1
+  args.onStep(`hunters: ${lenses.length} reading the diff${many ? ` in ${batches.length} parts` : ''}`)
   const quick = args.depth === 'quick' ? ' Cover security too: injection, missing auth, secrets in code.' : ''
-  const asked = async (lens: Lens, retry = false) =>
+  const asked = async (lens: Lens, part: number, retry = false) =>
     $.model.complete(
       {
         model: args.model,
         system: HUNTER_SYSTEM,
-        prompt: [...shared, { text: LENSES[lens] + quick + (args.focus ? ` The author asks you to focus on: ${args.focus}.` : '') + ' Reply with the JSON array now, nothing before it.' }],
+        prompt: [
+          { text: (args.review.text ? `<REVIEW.md>\n${args.review.text}\n</REVIEW.md>\n\n` : '') + `<diff${many ? ` part="${part + 1} of ${batches.length}"` : ''}>\n${batches[part]}\n</diff>`, cache: true },
+          { text: LENSES[lens] + quick + (args.focus ? ` The author asks you to focus on: ${args.focus}.` : '') + ' Reply with the JSON array now, nothing before it.' },
+        ],
         maxTokens: retry ? 6000 : args.depth === 'deep' ? 6000 : 3500,
         effort: retry ? 'low' : args.depth === 'deep' ? 'high' : 'medium',
         timeoutMs: 180000,
       },
       args.signal ? { signal: args.signal } : undefined,
     )
-  const calls = lenses.map(lens => asked(lens).then((r: any) => ({ lens, r })))
-  let results: { lens: Lens; r: any; retried?: boolean }[] = await Promise.all(calls)
-  // one more try for a hunter that did not answer (an overloaded API, a dropped connection)
-  results = await Promise.all(results.map(async ({ lens, r }) => {
-    args.spend(r)
-    if (r.isAnswered || r.reason === 'aborted') return { lens, r, retried: false }
-    const again = await asked(lens, true)
-    return { lens, r: again, retried: true }
-  }))
+  // a usable answer is one that was answered and reads as a JSON array; anything else gets one more try
+  const usable = (r: any) => r.isAnswered && parseJsonArray(r.text) !== null
+  const jobs = lenses.flatMap(lens => batches.map((_, part) => ({ lens, part })))
+  const results = await Promise.all(
+    jobs.map(async ({ lens, part }) => {
+      let r = await asked(lens, part)
+      args.spend(r)
+      if (!usable(r) && r.reason !== 'aborted') {
+        r = await asked(lens, part, true)
+        args.spend(r)
+      }
+      return { lens, part, r }
+    }),
+  )
   const raw: any[] = []
   let failed = 0
   const reasons: string[] = []
-  for (const { lens, r, retried } of results) {
-    if (retried) args.spend(r)
+  for (const { lens, part, r } of results) {
+    const who = lens + (many ? ` (part ${part + 1})` : '')
     if (!r.isAnswered) {
       failed++
-      reasons.push(`${lens}: ${r.reason === 'api-error' ? `api error${r.status ? ' ' + r.status : ''} ${r.error ?? ''}`.trim() : r.reason}`)
+      reasons.push(`${who}: ${r.reason === 'api-error' ? `api error${r.status ? ' ' + r.status : ''} ${r.error ?? ''}`.trim() : r.reason}`)
       continue
     }
-    for (const f of parseJsonArray(r.text)) {
+    const list = parseJsonArray(r.text)
+    if (list === null) {
+      failed++
+      reasons.push(`${who}: the answer was not a readable list (cut off or garbled)`)
+      continue
+    }
+    for (const f of list) {
       if (!f || typeof f !== 'object' || !f.file) continue
       const line = Number.parseInt(String(f.line ?? ''), 10)
       raw.push({ ...f, line: Number.isFinite(line) ? line : null, lens })
@@ -553,6 +625,9 @@ async function hunt($: any, args: {
 }
 
 
+// one finding's votes: asked is how many verifiers were meant to vote, of how many gave a readable verdict
+type Tally = { real: number; pre: number; of: number; asked: number }
+
 async function verify($: any, args: {
   model: string
   depth: Depth
@@ -561,43 +636,60 @@ async function verify($: any, args: {
   spend: (r: any) => void
   onStep: (s: string) => void
   signal?: AbortSignal
-}): Promise<{ votes: Map<any, { real: number; pre: number; of: number }> }> {
-  const votes = new Map<any, { real: number; pre: number; of: number }>()
+}): Promise<{ votes: Map<any, Tally> }> {
+  const votes = new Map<any, Tally>()
   const n = args.depth === 'quick' ? 0 : args.depth === 'deep' ? 3 : 2
   if (n === 0 || args.raw.length === 0) return { votes }
   args.onStep(`verifiers: ${n} votes on ${args.raw.length} finding${args.raw.length === 1 ? '' : 's'}`)
   const calls: Promise<void>[] = []
   for (const f of args.raw) {
-    const tally = { real: 0, pre: 0, of: n }
+    const tally: Tally = { real: 0, pre: 0, of: 0, asked: n }
     votes.set(f, tally)
     const hunk = hunkFor(args.files, String(f.file), typeof f.line === 'number' ? f.line : null)
+    const ask = () =>
+      $.model.complete(
+        {
+          model: args.model,
+          system: VERIFIER_SYSTEM,
+          prompt: `<hunk file="${f.file}">\n${hunk}\n</hunk>\n\nClaim (${f.severity ?? 'important'}, ${f.lens}): ${f.title}\nClass: ${f.class ?? ''}\nEvidence given: ${f.why ?? ''}\n\nVerdict JSON:`,
+          maxTokens: 120,
+          effort: 'low',
+          timeoutMs: 60000,
+        },
+        args.signal ? { signal: args.signal } : undefined,
+      )
     for (let i = 0; i < n; i++) {
       calls.push(
-        $.model.complete(
-          {
-            model: args.model,
-            system: VERIFIER_SYSTEM,
-            prompt: `<hunk file="${f.file}">\n${hunk}\n</hunk>\n\nClaim (${f.severity ?? 'important'}, ${f.lens}): ${f.title}\nClass: ${f.class ?? ''}\nEvidence given: ${f.why ?? ''}\n\nVerdict JSON:`,
-            maxTokens: 120,
-            effort: 'low',
-            timeoutMs: 60000,
-          },
-          args.signal ? { signal: args.signal } : undefined,
-        ).then((r: any) => {
+        (async () => {
+          let r = await ask()
           args.spend(r)
-          if (!r.isAnswered) {
-            tally.of-- // an unanswered verifier abstains
-            return
+          let v = r.isAnswered ? verdictOf(r.text) : null
+          // one more try for a verifier that did not answer or whose verdict could not be read
+          if (v === null && r.reason !== 'aborted') {
+            r = await ask()
+            args.spend(r)
+            v = r.isAnswered ? verdictOf(r.text) : null
           }
-          const v = String(parseJsonObject(r.text).verdict ?? '').toLowerCase()
-          if (v.startsWith('real')) tally.real++
-          else if (v.startsWith('pre')) tally.pre++
-        }),
+          if (v === null) return // abstains: it neither confirms nor clears the finding
+          tally.of++
+          if (v === 'real') tally.real++
+          else if (v === 'pre') tally.pre++
+        })(),
       )
     }
   }
   await Promise.all(calls)
   return { votes }
+}
+
+// a finding is dropped only when enough verifiers gave a readable verdict and none called it real;
+// too few readable verdicts keeps it open, so a bad answer can turn a run red but never green
+function confirmedBy(v: Tally, seen: number): { confirmed: boolean; unverified: boolean } {
+  if (v.asked === 0) return { confirmed: true, unverified: false } // quick depth: no vote is taken
+  const quorum = Math.floor(v.asked / 2) + 1
+  if (v.real >= 1 || (seen > 1 && v.real + v.pre >= 1)) return { confirmed: true, unverified: false }
+  if (v.of < quorum) return { confirmed: true, unverified: true }
+  return { confirmed: false, unverified: false }
 }
 
 // ---------- the run: every layer in order ----------
@@ -660,12 +752,34 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   const project = await loadProject($, root)
   const allFiles = await splitDiff(snap.diff)
   const files = allFiles.filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
-  const diffHash = await sha(files.map(f => f.hash).join(','))
+  const diffHash = await changeHash(files, snap)
   const family = `${snap.branch}`
   const round = await roundOf($, root, project, family, snap.base)
   const roundCap = Math.max(1, Number(args.options.roundCap ?? 3) || 3)
 
-  if (files.length === 0) {
+  // first, before anything the rules shape (which files count, the verdict that stands): REVIEW.md's rules
+  // (check commands, Skip, Always human) apply only as a person allowed them (/land trust):
+  // an agent's edit or a cloned project cannot slip a command in or hide a file from review. Detected checks
+  // (npm test and the like) run as they would from the terminal.
+  if (!(await rulesTrusted(project, review))) {
+    layer('verify', 'fail', `REVIEW.md has rules not yet allowed: /land trust`)
+    for (const name of ['risk tier', 'hunters', 'verifiers', 'security', 'converge']) layer(name, 'skip', '')
+    layer('gate', 'fail', 'push blocked until the rules are allowed and /land is green')
+    project.pass = { diffHash, head: snap.head, tier: 'medium', status: 'red', approved: false, note: '', at: Date.now(), open: 0, scope: scopeLine(snap), humanTouches: 0, blockers: ['untrusted'] }
+    project.findings = []
+    project.lastAt = Date.now()
+    await saveProject($, root, project)
+    const v = viewOf(root, project, snap, layers, [], tokens, round.streak ?? round.count)
+    await update($, view, () => v)
+    $.ui.status(undefined)
+    return {
+      text: `review-layers · WAITING: REVIEW.md's rules ${project.trustedRules ? 'changed since a person last allowed them' : 'have not been allowed yet'}. They decide what runs and what is reviewed:\n${rulesList(review)}\n\nRead them. If they are what you expect, type /land trust, then /land. Nothing ran and no tokens were spent.`,
+      context: [`review-layers did not run: REVIEW.md's check commands or review rules have not been allowed by a person. Show the user the rules and ask them to type /land trust if they are what they expect. Do not run /land trust for them.`],
+      view: v,
+    }
+  }
+
+  if (files.length === 0 && !snap.unread?.length) {
     $.ui.status(undefined)
     const v: View = { ...current, root, status: 'idle', line: 'review-layers: nothing to review', step: '' }
     await update($, view, () => v)
@@ -677,7 +791,8 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
     $.ui.status(undefined)
     const v = viewOf(root, project, snap, layers.map(l => ({ ...l, state: 'pass', note: 'unchanged since the last green run' })), [], tokens, round.streak ?? round.count)
     await update($, view, () => v)
-    return { text: `review-layers: these exact changes are already green (round ${round.streak ?? round.count}, ${project.pass.tier} risk)${project.pass.approved || project.pass.tier === 'low' ? ', cleared to push.' : ': run /land approve to clear the push.'}`, context: [], view: v }
+    const waits = passNeedsPerson(project.pass) && !project.pass.approved
+    return { text: `review-layers: these exact changes are already green (round ${round.streak ?? round.count}, ${project.pass.tier} risk)${waits ? ': run /land approve to clear the push.' : ', cleared to push.'}`, context: [], view: v }
   }
 
   // new work after a green run is a new attempt: the streak the cap judges starts again
@@ -686,11 +801,14 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   round.count += 1
   round.streak = (round.streak ?? 0) + 1
   current = { ...current, root, round: round.streak }
+  const overCap = round.streak > roundCap
 
   // layer 1: verify, with the project's own checks
-  const cmds = await detectChecks($, root, review, args.depth)
+  const cmds = overCap ? [] : await detectChecks($, root, review, args.depth)
   let evidence: Evidence[] = []
-  if (cmds.length) {
+  if (overCap) {
+    layer('verify', 'skip', '')
+  } else if (cmds.length) {
     layer('verify', 'run', '')
     evidence = await runChecks($, root, cmds, s => void show(s))
     const failed = evidence.find(e => !e.ok)
@@ -699,22 +817,25 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
     layer('verify', 'skip', 'no checks found (add a ## Checks section to REVIEW.md)')
   }
   current = { ...current, evidence }
+  const checksFailed = evidence.some(e => !e.ok)
 
-  // layer 2: risk tier, from the change
+  // layer 2: risk tier, from the change. A red check or a round past the cap spends no model call on it.
   await show('risk tier')
   const sessionModel: string = await $.session.model()
   const model = pickModel(args.options, sessionModel, args.depth)
-  const { tier, why } = await riskTier($, model === sessionModel ? 'haiku' : model, files, review, spend)
+  const { tier, why } = await riskTier($, model === sessionModel ? 'haiku' : model, files, review, spend, !checksFailed && !overCap)
   layer('risk tier', 'pass', `${tier}: ${why}`)
   current = { ...current, tier }
 
   // layers 3 to 5: hunters and verifiers, unless the round cap says step back
-  const checksFailed = evidence.some(e => !e.ok)
   let findings: Finding[] = []
   let repeats: Finding[] = []
   let hunterNote = ''
   let hunterGap = ''
-  const overCap = round.streak > roundCap
+  // what this run did not read: trimmed or left-out diff, new files past the limit. A run with any of it
+  // can be green, but only a person's /land approve <note> clears it for a push.
+  const unreadFiles: string[] = [...(snap.unread ?? [])]
+  let unreadChars = 0
   if (overCap) {
     layer('hunters', 'skip', `round ${round.streak} is past the cap of ${roundCap}: step back`)
     layer('verifiers', 'skip', '')
@@ -726,13 +847,15 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   } else {
     // diff-only re-review after the first round: files whose diff is unchanged are not re-read
     const changed = round.count > 1 ? files.filter(f => round.fileHashes[f.file] !== f.hash) : files
-    const budget = budgetDiff(changed, Math.max(5000, Number(args.options.maxDiffChars ?? 40000) || 40000))
+    const budget = batchDiff(changed, Math.max(5000, Number(args.options.maxDiffChars ?? 40000) || 40000), MAX_PARTS)
+    unreadChars = budget.cut
+    unreadFiles.push(...budget.trimmed)
     if (changed.length === 0) {
       layer('hunters', 'pass', 'nothing changed since the last round')
       layer('verifiers', 'skip', '')
     } else {
       layer('hunters', 'run', '')
-      const { raw, failed, reasons } = await hunt($, { model, depth: args.depth, diffText: budget.text, review, focus: args.focus, spend, onStep: s => void show(s) })
+      const { raw, failed, reasons } = await hunt($, { model, depth: args.depth, batches: budget.parts, review, focus: args.focus, spend, onStep: s => void show(s) })
       hunterGap = failed ? reasons.join('; ') : ''
 
       // dedupe across hunters first, so a finding three hunters raised is verified once, not three times
@@ -741,16 +864,18 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
 
       let n = 0
       let dropped = 0
+      let unjudged = 0
       for (const u of unique) {
         const x = u.f
-        const v = votes.get(x) ?? { real: 0, pre: 0, of: 0 }
+        const v = votes.get(x) ?? { real: 0, pre: 0, of: 0, asked: 0 }
         const sev: Finding['severity'] = x.severity === 'nit' ? 'nit' : x.severity === 'pre-existing' ? 'pre-existing' : 'important'
-        const confirmed = v.of === 0 ? true : v.real >= 1 || (u.seen > 1 && v.real + v.pre >= 1)
+        const { confirmed, unverified } = confirmedBy(v, u.seen)
         const styleOnly = /\b(style|format|naming|rename|comment|typo|whitespace|cleanup|refactor|readab)/i.test(String(x.class ?? '') + ' ' + String(x.title ?? ''))
         if (!confirmed || (styleOnly && sev !== 'important')) {
           dropped++
           continue
         }
+        if (unverified) unjudged++
         const finding: Finding = {
           n: 0,
           file: String(x.file),
@@ -766,6 +891,7 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
           of: v.of + (u.seen - 1),
           status: round.resolved[u.fp] ? 'resolved' : round.posted[u.fp] ? 'repeat' : 'open',
           fp: u.fp,
+          ...(unverified ? { unverified: true } : {}),
         }
         if (finding.status === 'resolved') continue
         if (finding.status === 'repeat') {
@@ -778,15 +904,15 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
       const order = { important: 0, nit: 1, 'pre-existing': 2 }
       findings.sort((a, b) => order[a.severity] - order[b.severity] || b.votes - a.votes)
       findings.forEach((f, i) => (f.n = i + 1))
-      hunterNote = `${raw.length} raised (${unique.length} distinct), ${findings.length} confirmed, ${dropped} dropped${repeats.length ? `, ${repeats.length} still open from earlier rounds` : ''}${failed ? `, ${failed} hunter${failed === 1 ? '' : 's'} did not answer (${reasons.join('; ')})` : ''}${budget.cut ? `, diff trimmed by ${kTokens(budget.cut)} chars` : ''}`
+      hunterNote = `${raw.length} raised (${unique.length} distinct), ${findings.length} confirmed, ${dropped} dropped${unjudged ? `, ${unjudged} kept open as the verifiers could not judge ${unjudged === 1 ? 'it' : 'them'}` : ''}${repeats.length ? `, ${repeats.length} still open from earlier rounds` : ''}${failed ? `, ${failed} hunter${failed === 1 ? '' : 's'} failed (${reasons.join('; ')})` : ''}${budget.parts.length > 1 ? `, read in ${budget.parts.length} parts` : ''}${budget.cut ? `, ${kTokens(budget.cut)} chars of diff not read` : ''}`
       layer('hunters', findings.length || repeats.length ? 'fail' : 'pass', hunterNote)
-      layer('verifiers', 'pass', args.depth === 'quick' ? 'skipped at quick depth' : `${votes.size ? 'voted' : 'nothing to vote on'}`)
+      layer('verifiers', 'pass', args.depth === 'quick' ? 'skipped at quick depth' : `${votes.size ? 'voted' : 'nothing to vote on'}${unjudged ? `, ${unjudged} could not be judged` : ''}`)
       for (const f of findings) round.posted[f.fp] = round.count
     }
     const sec = [...findings, ...repeats].filter(f => isSecurity(f) && f.severity !== 'pre-existing')
     layer('security', sec.length ? 'fail' : 'pass', sec.length ? `${sec.length} open` : 'clean')
-    // only a run every hunter answered counts as having read these files
-    if (!hunterGap) for (const f of files) round.fileHashes[f.file] = f.hash
+    // only a run every hunter answered counts as having read these files, and only the files it read whole
+    if (!hunterGap) for (const f of files) if (!budget.trimmed.includes(f.file)) round.fileHashes[f.file] = f.hash
   }
 
   // layer 6: converge
@@ -794,14 +920,16 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   const nits = findings.filter(f => f.severity === 'nit').length
   layer('converge', overCap ? 'fail' : open.length ? 'run' : 'pass', overCap ? `${round.streak} rounds: reconsider the approach` : `round ${round.streak} of ${roundCap}`)
 
-  // layer 7: the gate's verdict
-  const status: Pass['status'] = checksFailed || open.length || overCap || hunterGap ? 'red' : 'green'
+  // layer 7: the gate's verdict. blockers are the reasons for red that are not findings: a resolve
+  // can answer a finding, never these.
+  const blockers: Blocker[] = [...(checksFailed ? (['checks'] as const) : []), ...(overCap ? (['cap'] as const) : []), ...(hunterGap ? (['incomplete'] as const) : [])]
+  const status: Pass['status'] = open.length || blockers.length ? 'red' : 'green'
   if (hunterGap && !open.length && !checksFailed && !overCap) {
     layer('hunters', 'fail', `not every hunter answered (${hunterGap}): run /land again`)
     round.count = Math.max(0, round.count - 1) // an API hiccup is not a review round
     round.streak = Math.max(0, round.streak - 1)
   }
-  const needsApproval = needsPerson(tier)
+  const partial = unreadFiles.length || unreadChars ? unreadSummary(unreadFiles, unreadChars) : ''
   const prior = project.pass && project.pass.diffHash === diffHash ? project.pass : undefined
   const pass: Pass = {
     diffHash,
@@ -814,8 +942,11 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
     open: open.length,
     scope: scopeLine(snap),
     humanTouches: prior?.humanTouches ?? 0,
+    blockers,
+    ...(partial ? { partial } : {}),
   }
-  layer('gate', status === 'green' ? (needsApproval && !pass.approved ? 'run' : 'pass') : 'fail', status === 'green' ? (needsApproval && !pass.approved ? `${tier} risk: /land approve to clear the push` : 'cleared to push') : 'push blocked until green')
+  const needsApproval = passNeedsPerson(pass)
+  layer('gate', status === 'green' ? (needsApproval && !pass.approved ? 'run' : 'pass') : 'fail', status === 'green' ? (needsApproval && !pass.approved ? (partial ? `part of the change was not read: /land approve <note> to clear the push` : `${tier} risk: /land approve to clear the push`) : 'cleared to push') : 'push blocked until green')
 
   project.pass = pass
   round.converged = status === 'green'
@@ -834,7 +965,7 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
 
   // the report
   const lines: string[] = []
-  const head = status === 'green' ? `GREEN: ${tier} risk, round ${round.streak}` : overCap ? `STEP BACK: ${round.streak} rounds on ${snap.branch} without converging` : hunterGap && !open.length && !checksFailed ? `INCOMPLETE: a hunter did not answer, run /land again` : `RED: ${open.length} open finding${open.length === 1 ? '' : 's'}${checksFailed ? ', checks failing' : ''}`
+  const head = status === 'green' ? `GREEN: ${tier} risk, round ${round.streak}` : overCap ? `STEP BACK: ${round.streak} rounds on ${snap.branch} without converging` : hunterGap && !open.length && !checksFailed ? `INCOMPLETE: a hunter failed, run /land again` : `RED: ${open.length} open finding${open.length === 1 ? '' : 's'}${checksFailed ? ', checks failing' : ''}`
   lines.push(`review-layers · ${head} · ${snap.branch} (${scopeLine(snap)}) · ${files.length} file${files.length === 1 ? '' : 's'} · ${kTokens(tokens)} tokens${cached ? ` (${kTokens(cached)} cache reads)` : ''} · ${secs(Date.now() - started)}`)
   for (const l of layers) lines.push(`  ${mark(l.state)} ${l.name.padEnd(10)} ${l.note}`)
   for (const e of evidence) lines.push(`\n$ ${e.cmd}  (${e.ok ? 'ok' : 'FAILED'}, ${secs(e.ms)})\n${e.tail.split('\n').map(x => '  ' + x).join('\n')}`)
@@ -844,7 +975,9 @@ async function landOnce($: any, args: RunArgs): Promise<RunResult> {
   }
   if (nits && !open.length) lines.push(`\n${nits} nit${nits === 1 ? '' : 's'} listed above do not block.`)
   if (overCap) lines.push(`\nThree-plus rounds usually means the approach, not the code, is the problem. Reconsider it with the person, or /land reset to start the count over on purpose.`)
-  if (status === 'green' && needsApproval && !pass.approved) lines.push(`\n${tier === 'high' ? 'High' : 'Medium'} risk: a person reads the evidence above and runs /land approve${tier === 'high' ? ' <note>' : ''} before this can be pushed.`)
+  if (partial) lines.push(`\nNot reviewed: ${partial}. A green here covers only what was read.${status === 'green' ? ' A person checks the rest and runs /land approve <note> before this can be pushed.' : ''} Raise the diff budget (maxDiffChars) or land the work in smaller pieces to have it all read.`)
+  if (hunterGap && open.length) lines.push(`\nA hunter failed (${hunterGap}), so this review is incomplete: answer the findings, then run /land again.`)
+  if (status === 'green' && needsApproval && !pass.approved && !partial) lines.push(`\n${tier === 'high' ? 'High' : 'Medium'} risk: a person reads the evidence above and runs /land approve${tier === 'high' ? ' <note>' : ''} before this can be pushed.`)
   if (status === 'green' && (!needsApproval || pass.approved)) lines.push(`\nCleared: ${tier} risk${tier === 'medium' ? ' (you prompted it, so you are its reviewer)' : ''} needs no${pass.approved ? ' further' : ''} typed approval. git push and gh pr create will go through.`)
   if (open.length) lines.push(`\nEvery finding must be answered: fix it (every instance of its class), or /land resolve <n> <reason>. Then run /land again (/land fix asks Claude to do it).`)
 
@@ -868,7 +1001,7 @@ function mark(state: Layer['state']): string {
 function formatFinding(f: Finding): string {
   const where = f.line ? `${f.file}:${f.line}` : f.file
   const tag = f.severity === 'important' ? 'IMPORTANT' : f.severity === 'nit' ? 'nit' : 'pre-existing'
-  const votes = f.of ? ` (${f.votes}/${f.of} votes${f.votes * 2 < f.of ? ', contested' : ''})` : ''
+  const votes = f.unverified ? ' (kept open: the verifiers could not judge it)' : f.of ? ` (${f.votes}/${f.of} votes${f.votes * 2 < f.of ? ', contested' : ''})` : ''
   const others = [...new Set(f.instances)].filter(i => i !== where && i !== f.file)
   const more = others.length ? `\n   also: ${others.slice(0, 6).join(', ')}` : ''
   return `${f.n ? f.n + '.' : '  '} [${tag}${isSecurityHole(f) ? ', security' : isSecurity(f) ? ', security lens' : ''}${f.status === 'repeat' ? ', still open' : ''}] ${where}: ${f.title}${votes}\n   class: ${f.cls}\n   why: ${f.why}\n   fix: ${f.fix}${more}`
@@ -876,7 +1009,7 @@ function formatFinding(f: Finding): string {
 
 function viewOf(root: string, project: Project, snap: Snapshot, layers: Layer[], findings: Finding[], tokens: number, round: number, evidence: Evidence[] = []): View {
   const pass = project.pass
-  const needsApproval = !!pass && needsPerson(pass.tier)
+  const needsApproval = !!pass && passNeedsPerson(pass)
   const status: View['status'] = !pass ? 'idle' : pass.status === 'green' ? (needsApproval && !pass.approved ? 'amber' : 'green') : 'red'
   const line = !pass
     ? 'review-layers: not run yet'
@@ -907,14 +1040,53 @@ async function gateVerdict($: any, options: Record<string, unknown>, command: st
   const what = PR.test(command) ? 'opening or merging a PR' : 'a push'
   const say = (why: string) => (mode === 'warn' ? { warn: why } : { deny: `review-layers: ${why}` })
   if (!project?.pass) return say(`${what} waits for /land: these changes have not been reviewed.`)
+  if (!(await rulesTrusted(project, review))) return say(`${what} waits: REVIEW.md's check commands or review rules changed since a person allowed them. The person reads them and types /land trust, then /land runs.`)
   const snap = await snapshot($, cwd)
   const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
-  const diffHash = await sha(files.map(f => f.hash).join(','))
+  const diffHash = await changeHash(files, snap)
   const pass = project.pass
-  if (files.length && pass.diffHash !== diffHash) return say(`${what} waits for /land: the changes differ from the ones last reviewed (${new Date(pass.at).toLocaleTimeString('en-ZA')}).`)
-  if (pass.status !== 'green') return say(`${what} is blocked: the last /land was red with ${pass.open} open finding(s). Fix or /land resolve them, then run /land.`)
+  if ((files.length || snap.unread?.length) && pass.diffHash !== diffHash) return say(`${what} waits for /land: the changes differ from the ones last reviewed (${new Date(pass.at).toLocaleTimeString('en-ZA')}).`)
+  if (pass.status !== 'green') return say(`${what} is blocked: the last /land was red (${redWhy(pass)}). ${pass.open ? 'Fix or /land resolve the findings, then run /land.' : 'Run /land again once that is fixed.'}`)
+  if (pass.partial && !pass.approved) return say(`${what} waits for a person: the last /land did not read the whole change (${pass.partial}). Check that part, then /land approve <note>.`)
   if (needsPerson(pass.tier) && !pass.approved) return say(`${what} waits for a person: ${pass.tier} risk needs /land approve${pass.tier === 'high' ? ' <note>' : ''} after reading the evidence.`)
   return {}
+}
+
+function redWhy(p: Pass): string {
+  const why: string[] = []
+  if (p.open) why.push(`${p.open} open finding${p.open === 1 ? '' : 's'}`)
+  for (const b of p.blockers ?? []) why.push(b === 'checks' ? 'a check failed' : b === 'cap' ? 'past the round cap' : b === 'incomplete' ? 'a hunter failed, so the review is incomplete' : 'REVIEW.md rules wait for /land trust')
+  return why.join(', ') || 'see /land status'
+}
+
+// whether the session's project uses review-layers. A folder's git root, once found, is remembered; the
+// store and REVIEW.md are read each time, so a first /land switches it on mid-session.
+const roots = new Map<string, string>()
+async function optedIn($: any): Promise<boolean> {
+  try {
+    const cwd: string = await $.session.cwd()
+    // only a found root is remembered: a folder that is not a repo yet is asked again next time
+    if (!roots.has(cwd)) {
+      const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+      if (top.exitCode === 0) roots.set(cwd, top.stdout.trim())
+    }
+    const root = roots.get(cwd)
+    if (!root) return false
+    if ((await loadProjects($))[root]) return true
+    return !!(await readReviewMd($, root)).path
+  } catch {
+    return false
+  }
+}
+
+// /land trust and /land approve are a person's sign-off. They are refused from a source no person typed: another
+// session or agent, a schedule, a background task, a relayed channel, or another plugin. The person's own
+// Enter, their phone (bridge), their app or `claude -p` (sdk) are accepted; the Bash hook refuses the model's
+// own route to sdk, a shell command that runs /land trust or /land approve.
+const SIGN_OFF = /\/land\s+(trust|approve)\b/
+const fromPerson = (origin: unknown) => isPersonOrigin(origin, NAME)
+function notAPerson(what: string): string {
+  return `review-layers: /land ${what} is a person's sign-off and only counts when they type it (or press the button). It was not run.`
 }
 
 // a push that went through is a landing: count whether a person had to touch it
@@ -946,15 +1118,16 @@ async function cmdStatus($: any): Promise<string> {
   const root = top.stdout.trim()
   const project = (await loadProjects($))[root]
   const snap = await snapshot($, cwd)
-  const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file))
-  const hash = await sha(files.map(f => f.hash).join(','))
+  const review = await readReviewMd($, root)
+  const files = (await splitDiff(snap.diff)).filter(f => !GENERATED.test(f.file) && !review.skip.some(re => re.test(f.file)))
+  const hash = await changeHash(files, snap)
   const round = project ? ((await roundOf($, root, project, snap.branch, snap.base)).streak ?? 0) : 0
   if (!project?.pass) return `review-layers: ${snap.branch} (${scopeLine(snap)}), ${files.length} file(s) changed, not reviewed yet. Run /land.`
   const p = project.pass
   const same = p.diffHash === hash
   return [
     `review-layers: ${snap.branch} (${scopeLine(snap)}), ${files.length} file(s) changed, round ${round}.`,
-    `last run: ${p.status.toUpperCase()}, ${p.tier} risk, ${p.open} open, ${same ? 'same changes' : 'CHANGES DIFFER since then: run /land again'}, ${p.approved ? 'approved' + (p.note ? ' (' + p.note + ')' : '') : !needsPerson(p.tier) ? 'no typed approval needed' : 'not yet approved'}.`,
+    `last run: ${p.status.toUpperCase()}${p.status === 'red' ? ` (${redWhy(p)})` : ''}, ${p.tier} risk, ${p.open} open, ${same ? 'same changes' : 'CHANGES DIFFER since then: run /land again'}, ${p.approved ? 'approved' + (p.note ? ' (' + p.note + ')' : '') : !passNeedsPerson(p) ? 'no typed approval needed' : 'not yet approved'}.${p.partial ? ` Not read in full: ${p.partial}.` : ''}`,
     `project totals: ${project.runs} run(s), ${kTokens(project.tokens)} tokens. human time: ${humanOf(project).landings} landing(s), ${humanOf(project).landingsNoPerson} with no person in the loop, ${humanOf(project).approvals} approval(s), ${humanOf(project).resolves} resolve(s) typed.`,
   ].join('\n')
 }
@@ -966,7 +1139,8 @@ async function cmdApprove($: any, note: string): Promise<string> {
   const root = top.stdout.trim()
   const project = await loadProject($, root)
   if (!project.pass) return 'Nothing to approve: run /land first.'
-  if (project.pass.status !== 'green') return `Not green yet: ${project.pass.open} open finding(s). Fix or resolve them and run /land again before approving.`
+  if (project.pass.status !== 'green') return `Not green yet (${redWhy(project.pass)}). Fix that and run /land again before approving.`
+  if (project.pass.partial && !note) return `The last run did not read the whole change (${project.pass.partial}). Approving needs a note saying what you checked: /land approve <note>.`
   if (project.pass.tier === 'high' && !note) return 'High risk needs a note saying what you checked: /land approve <note>.'
   project.pass.approved = true
   project.pass.note = note
@@ -999,14 +1173,17 @@ async function cmdResolve($: any, args: string): Promise<string> {
   const stillOpen = project.findings.filter(x => x.status !== 'resolved' && (x.severity === 'important' || isSecurity(x)))
   if (project.pass) {
     project.pass.open = stillOpen.length
-    if (!stillOpen.length && project.pass.status === 'red' && !project.findings.some(x => x.status !== 'resolved' && x.severity === 'important')) project.pass.status = 'green'
-    if (project.pass.status === 'green' && !needsPerson(project.pass.tier)) project.pass.approved = project.pass.approved || false
+    // a resolve answers findings, nothing else: a run that is red for any other reason (a failed check,
+    // a hunter that failed, the round cap) stays red. A record from before blockers were kept is not trusted
+    // to be complete, so it waits for /land too.
+    const onlyFindings = Array.isArray(project.pass.blockers) && project.pass.blockers.length === 0
+    if (!stillOpen.length && project.pass.status === 'red' && onlyFindings) project.pass.status = 'green'
   }
   await saveProject($, root, project)
   const nowGreen = project.pass?.status === 'green'
-  const nextStatus: View['status'] = nowGreen ? (project.pass && needsPerson(project.pass.tier) && !project.pass.approved ? 'amber' : 'green') : 'red'
+  const nextStatus: View['status'] = nowGreen ? (project.pass && passNeedsPerson(project.pass) && !project.pass.approved ? 'amber' : 'green') : 'red'
   await update($, view, v => (v ? { ...v, findings: project.findings, status: nextStatus, line: nowGreen ? `land ✓ green · ${project.pass!.tier} risk` : v.line } : v))
-  return `Resolved ${n} (${f.title}): ${reason}. It will not be posted again on this branch.${stillOpen.length ? ` ${stillOpen.length} still open.` : project.pass?.status === 'green' ? ' Nothing else open: green.' : ' Run /land to confirm.'}`
+  return `Resolved ${n} (${f.title}): ${reason}. It will not be posted again on this branch.${stillOpen.length ? ` ${stillOpen.length} still open.` : project.pass?.status === 'green' ? ' Nothing else open: green.' : project.pass?.blockers?.length ? ` Still red (${redWhy(project.pass)}): run /land again.` : ' Run /land to confirm.'}`
 }
 
 async function cmdLearn($: any, note: string): Promise<string> {
@@ -1027,6 +1204,22 @@ async function cmdLearn($: any, note: string): Promise<string> {
   else text = text.replace(/\s*$/, '') + '\n\n## Watch for\n' + line + '\n'
   await $.fs.write(path, text)
   return `Added to ${path.replace(root + '/', '')} under "Watch for": ${note.trim()}`
+}
+
+// a person allows REVIEW.md's rules (check commands, Skip, Always human) as they stand now; any change asks again
+async function cmdTrust($: any): Promise<string> {
+  const cwd: string = await $.session.cwd()
+  const top = await sh($, ['git', 'rev-parse', '--show-toplevel'], { cwd })
+  if (top.exitCode !== 0) return 'review-layers: not a git repository.'
+  const root = top.stdout.trim()
+  const review = await readReviewMd($, root)
+  const project = await loadProject($, root)
+  if (!review.rules.length && !project.trustedRules) return 'REVIEW.md has no check commands, Skip or Always human rules, so there is nothing to allow. /land runs the checks it finds itself (npm test and the like).'
+  project.trustedRules = await rulesHash(review)
+  if (project.pass?.blockers?.includes('untrusted')) delete project.pass
+  project.lastAt = Date.now()
+  await saveProject($, root, project)
+  return `Allowed REVIEW.md's rules as they stand:\n${rulesList(review)}\n\n/land follows them from now on. If any of them change, /land asks again. Run /land.`
 }
 
 async function cmdInit($: any): Promise<string> {
@@ -1092,7 +1285,7 @@ async function cmdEval($: any, options: Record<string, unknown>): Promise<string
     const show = await sh($, ['git', 'show', inc.sha, '--format=', '--no-color', '--patch'], { cwd: root, timeoutMs: 60000 })
     const files = (await splitDiff(show.stdout)).filter(f => !GENERATED.test(f.file))
     const budget = budgetDiff(files, Math.max(5000, Number(options.maxDiffChars ?? 40000) || 40000))
-    const { raw } = await hunt($, { model, depth: 'standard', diffText: budget.text, review, focus: '', spend, onStep: () => {} })
+    const { raw } = await hunt($, { model, depth: 'standard', batches: [budget.text], review, focus: '', spend, onStep: () => {} })
     let hit = false
     if (raw.length) {
       const judge = await $.model.complete({
@@ -1190,6 +1383,8 @@ export const register: Register = (on, options) => {
   // three lines in the system prompt: the whole process, from the model's side
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
+    // only where review-layers is on: a project where /land has run or that has a REVIEW.md, as for the gate
+    if (!(await optedIn($))) return r
     return {
       sections: [
         ...r.sections,
@@ -1206,6 +1401,8 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    // the sign-offs are a person's: the model may not start another Claude to type them for itself
+    if (SIGN_OFF.test(e.command)) return { deny: `review-layers: /land trust and /land approve are a person's sign-off. Show the user the evidence and ask them to type it in the chat themselves.` }
     const verdict = await gateVerdict($, options, e.command)
     if (verdict.deny) return { deny: verdict.deny }
     if (verdict.warn) $.ui.toast(`review-layers: ${verdict.warn}`)
@@ -1260,6 +1457,7 @@ export const register: Register = (on, options) => {
       case 'status':
         return { text: await cmdStatus($) }
       case 'approve':
+        if (!fromPerson(e.origin)) return { text: notAPerson('approve') }
         return { text: await cmdApprove($, rest) }
       case 'resolve':
         return { text: await cmdResolve($, rest) }
@@ -1267,6 +1465,9 @@ export const register: Register = (on, options) => {
         return { text: await cmdLearn($, rest) }
       case 'init':
         return { text: await cmdInit($) }
+      case 'trust':
+        if (!fromPerson(e.origin)) return { text: notAPerson('trust') }
+        return { text: await cmdTrust($) }
       case 'incident':
         return { text: await cmdIncident($, rest) }
       case 'eval':
@@ -1304,10 +1505,11 @@ export const register: Register = (on, options) => {
         const focus = first === 'quick' || first === 'deep' || first === 'standard' ? rest : raw
         const r = await land($, { depth, focus, options })
         // red with findings: the fix loop runs itself; a person reads the result when it is green or the cap is hit
-        const open = r.view.findings.filter(f => f.status !== 'resolved')
+        // only what blocks goes to the fix loop: a green run's nits are listed, never sent
+        const open = r.view.findings.filter(f => f.status !== 'resolved' && (f.severity === 'important' || isSecurity(f)))
         const overCap = r.view.layers.some(l => l.name === 'converge' && l.state === 'fail')
         const checksFailed = r.view.evidence.some(ev => !ev.ok)
-        if (autoFix() && !overCap && (open.length || checksFailed)) {
+        if (autoFix() && r.view.status === 'red' && !overCap && (open.length || checksFailed)) {
           send(
             checksFailed && !open.length
               ? `review-layers: a project check failed:\n\n${r.view.evidence.filter(ev => !ev.ok).map(ev => `$ ${ev.cmd}\n${ev.tail}`).join('\n\n')}\n\nFix the cause (not the check), run it again and show the passing output, then call the ${TOOL} tool to re-review. Do not push until it is green.`
